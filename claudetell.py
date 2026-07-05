@@ -19,7 +19,7 @@ Usage:
 Lights:
   green   idle, waiting for next user prompt
   amber   busy (working)                       [pulses]
-  blue    agents or background shells running
+  blue    agents, workflows or background shells running (count shown as a badge)
   mauve   loop scheduled/running (ScheduleWakeup)
   orange  waiting for user input (permissions / ask menu)
   red     error (usage limit, API error)       [pulses]
@@ -40,6 +40,7 @@ DEFAULT_PORT = 7717
 LOOP_GRACE = 120  # ponytail: mauve lingers this long past a scheduled wakeup
 AGENT_TTL = 2 * 3600  # ponytail: SubagentStop can be missed on crash; TTL self-heals
 SHELL_TTL = 4 * 3600
+WORKFLOW_TTL = 3600  # ponytail: no completion hook for Workflow — TTL is the only heal
 
 
 # -- shared helpers ---------------------------------------------------------
@@ -102,6 +103,7 @@ def cmd_hook() -> None:
             now = time.time()
             agents = st.get("agents", [])
             shells = st.get("shells", [])
+            workflows = st.get("workflows", [])
 
             if event == "PreToolUse":
                 tool = payload.get("tool_name", "")
@@ -109,6 +111,8 @@ def cmd_hook() -> None:
                 if tool in ("ScheduleWakeup", "CronCreate"):
                     delay = float(ti.get("delaySeconds") or ti.get("interval") or 600)
                     st["loop_until"] = now + min(delay, 3600) + LOOP_GRACE
+                elif tool == "Workflow":
+                    workflows.append(now)
                 elif tool == "Bash" and ti.get("run_in_background"):
                     shells.append(now)
             elif event == "SubagentStart":
@@ -123,9 +127,12 @@ def cmd_hook() -> None:
                 }
             elif event in ("UserPromptSubmit", "Stop"):
                 st.pop("error", None)  # turn completed / user retried → red clears
+                if event == "UserPromptSubmit":
+                    st.pop("loop_until", None)  # user took over → not a loop anymore
 
             st["agents"] = [t for t in agents if now - t < AGENT_TTL]
             st["shells"] = [t for t in shells if now - t < SHELL_TTL]
+            st["workflows"] = [t for t in workflows if now - t < WORKFLOW_TTL]
             st["updated"] = now
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(st))
@@ -218,31 +225,38 @@ def proc_descendants(pid: int) -> bool:
     return False
 
 
-def compute_light(base: str, st: dict, err: str | None, pid: int) -> tuple[str, str]:
+def compute_light(base: str, st: dict, err: str | None,
+                  pid: int) -> tuple[str, str, dict]:
     now = time.time()
-    agents = st.get("agents", [])
+    # prune here too: state can be read long after the last hook wrote it
+    agents = [t for t in st.get("agents", []) if now - t < AGENT_TTL]
     shells = [t for t in st.get("shells", []) if now - t < SHELL_TTL]
+    workflows = [t for t in st.get("workflows", []) if now - t < WORKFLOW_TTL]
     # bg shells have no completion hook — validate against live child processes
     if shells and not proc_descendants(pid):
         shells = []
+    counts = {"agents": len(agents), "shells": len(shells),
+              "workflows": len(workflows)}
     if err:
-        return "red", err[:300]
+        return "red", err[:300], counts
     if base == "waiting":
-        return "orange", "waiting for your input"
+        return "orange", "waiting for your input", counts
     if st.get("loop_until", 0) > now:
-        return "mauve", "loop running"
-    if agents or shells:
+        return "mauve", "loop running", counts
+    if agents or shells or workflows:
         parts = []
         if agents:
             parts.append(f"{len(agents)} agent{'s' if len(agents) > 1 else ''}")
+        if workflows:
+            parts.append(f"{len(workflows)} workflow{'s' if len(workflows) > 1 else ''}")
         if shells:
             parts.append(f"{len(shells)} background shell{'s' if len(shells) > 1 else ''}")
-        return "blue", " + ".join(parts)
+        return "blue", " + ".join(parts), counts
     if base == "busy":
-        return "busy", "working"
+        return "busy", "working", counts
     if base == "idle":
-        return "green", "waiting for next prompt"
-    return "gray", base or "unknown"
+        return "green", "waiting for next prompt", counts
+    return "gray", base or "unknown", counts
 
 
 def scan_sessions(show_all: bool = False) -> list[dict]:
@@ -272,7 +286,7 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
         else:
             # fallback: sessions started before hooks were installed
             err = transcript_error(sid)
-        light, detail = compute_light(data.get("status") or "", st, err, pid)
+        light, detail, counts = compute_light(data.get("status") or "", st, err, pid)
         entry = {
             "id": sid,
             "pid": pid,
@@ -285,6 +299,10 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             "status": data.get("status") or "unknown",
             "light": light,
             "detail": detail,
+            "agents": counts["agents"],
+            "workflows": counts["workflows"],
+            "shells": counts["shells"],
+            "bg": counts["agents"] + counts["workflows"] + counts["shells"],
         }
         # one session can own several pid files (e.g. resume); keep the freshest
         cur = best.get(sid)
@@ -351,6 +369,9 @@ def _overlay_css() -> bytes:
         "window.claudetell { background: rgba(30,30,46,0.88);"
         " border-radius: 13px; border: 1px solid rgba(69,71,90,0.9); }",
         ".light { border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }",
+        ".badge { background: rgba(30,30,46,0.95); color: #cdd6f4;"
+        " font-size: 8px; font-weight: 700; padding: 0 2px; border-radius: 999px;"
+        " border: 1px solid rgba(69,71,90,0.9); margin: 0 -2px -2px 0; }",
         "@keyframes ctpulse { 0% { opacity: 1; } 50% { opacity: 0.4; }"
         " 100% { opacity: 1; } }",
     ]
@@ -473,19 +494,38 @@ def cmd_overlay() -> None:
             pass
 
     def set_light_class(ebox, light: str) -> None:
-        ctx = ebox.get_child().get_style_context()
+        ctx = ebox._dot.get_style_context()
         for name in LIGHT_RGB:
             ctx.remove_class(name)
         ctx.add_class(light if light in LIGHT_RGB else "gray")
+
+    def set_badge(ebox, s: dict) -> None:
+        bg = s.get("bg", 0)
+        if bg > 0:
+            ebox._badge.set_text(str(bg))
+            ebox._badge.show()
+        else:
+            ebox._badge.hide()
 
     def make_light(s: dict) -> Gtk.EventBox:
         dot = Gtk.Box()
         dot.set_size_request(LIGHT_PX, LIGHT_PX)
         dot.get_style_context().add_class("light")
+        badge = Gtk.Label()
+        badge.get_style_context().add_class("badge")
+        badge.set_halign(Gtk.Align.END)
+        badge.set_valign(Gtk.Align.END)
+        badge.set_no_show_all(True)  # show_all() must not force it visible
+        overlay = Gtk.Overlay()
+        overlay.add(dot)
+        overlay.add_overlay(badge)
+        overlay.set_overlay_pass_through(badge, True)  # clicks fall through to ebox
         ebox = Gtk.EventBox(visible_window=False)
-        ebox.add(dot)
+        ebox.add(overlay)
         ebox.set_has_tooltip(True)
         ebox._s = s
+        ebox._dot = dot
+        ebox._badge = badge
 
         def tooltip(_w, _x, _y, _kb, tip):
             sess = ebox._s
@@ -548,6 +588,7 @@ def cmd_overlay() -> None:
                 changed = True
             el._s = s
             set_light_class(el, s["light"])
+            set_badge(el, s)
         for sid in list(lights):
             if sid not in seen:
                 lights.pop(sid).get_parent().destroy()
@@ -646,7 +687,7 @@ def hook_entries() -> dict[str, list[dict]]:
     hook = {"type": "command", "command": cmd, "timeout": 10}
     rule = [{"hooks": [hook]}]
     return {
-        "PreToolUse": [{"matcher": "Bash|ScheduleWakeup|CronCreate", "hooks": [hook]}],
+        "PreToolUse": [{"matcher": "Bash|ScheduleWakeup|CronCreate|Workflow", "hooks": [hook]}],
         "SubagentStart": rule,
         "SubagentStop": rule,
         "StopFailure": rule,
@@ -738,6 +779,7 @@ HTML = r"""<!doctype html>
   #lights.v { flex-direction: column; }
   #lights.grid { display: grid; grid-template-columns: repeat(4, 1fr); }
   .light {
+    position: relative;
     width: 22px; height: 22px; border-radius: 50%; cursor: default;
     border: 1px solid rgba(255,255,255,.15);
     background: radial-gradient(circle at 35% 30%,
@@ -755,6 +797,12 @@ HTML = r"""<!doctype html>
   .light.orange { --c: var(--orange); animation: pulse 1.1s ease-in-out infinite; }
   .light.red    { --c: var(--red);    animation: pulse .8s ease-in-out infinite; }
   .light.gray   { --c: var(--gray); }
+  .light .badge {
+    position: absolute; bottom: -4px; right: -4px; min-width: 13px; height: 13px;
+    padding: 0 3px; border-radius: 999px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); font-size: 9px; font-weight: 700;
+    line-height: 11px; text-align: center;
+  }
   @keyframes pulse {
     0%, 100% { filter: brightness(1); }
     50% { filter: brightness(.55); }
@@ -842,6 +890,11 @@ function render(data) {
     }
     el._s = s;
     el.className = "light " + s.light;
+    let badge = el.querySelector(".badge");
+    if (s.bg > 0) {
+      if (!badge) { badge = document.createElement("span"); badge.className = "badge"; el.appendChild(badge); }
+      badge.textContent = s.bg;
+    } else if (badge) badge.remove();
     lightsEl.appendChild(el);
   }
   for (const [id, el] of nodes) if (!seen.has(id)) { el.remove(); nodes.delete(id); }

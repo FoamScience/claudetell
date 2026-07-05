@@ -7,7 +7,7 @@ hover for details (name, folder, pid, uptime, state).
 |---|---|
 | 🟢 green | idle — waiting for your next prompt |
 | 🟡 amber (pulsing) | busy — working |
-| 🔵 blue | agents or background shells running |
+| 🔵 blue | agents, workflows or background shells running (count shown as a badge) |
 | 🟣 mauve | loop scheduled/running (`/loop`, ScheduleWakeup, cron) |
 | 🟠 orange | waiting for your input (permission / ask menu / btw) |
 | 🔴 red (pulsing) | error — usage limit, API error |
@@ -50,9 +50,11 @@ uv indirection.
 
 - Base state from `~/.claude/sessions/{pid}.json` (`busy|idle|waiting`, written
   by Claude Code itself; dead pids filtered).
-- Hooks (`PreToolUse Bash|ScheduleWakeup|CronCreate`, `SubagentStart/Stop`,
+- Hooks (`PreToolUse Bash|ScheduleWakeup|CronCreate|Workflow`, `SubagentStart/Stop`,
   `StopFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd`) write per-session
-  state to `~/.local/state/claudetell/`.
+  state to `~/.local/state/claudetell/`. Running agents/workflows show as a
+  count badge next to the light; `Workflow` has no completion hook, so its badge
+  self-heals on a TTL. Re-run `install` after upgrading to pick up the new hook.
 - Red also falls back to scanning the transcript tail for API-error entries,
   so it works without hooks; it clears itself on the next turn.
 - No dependencies, stdlib only. Server binds 127.0.0.1.
