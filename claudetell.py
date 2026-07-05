@@ -19,8 +19,8 @@ Usage:
 Lights:
   green   idle, waiting for next user prompt
   amber   busy (working)                       [pulses]
-  blue    agents, workflows or background shells running (count shown as a badge)
-  mauve   loop scheduled/running (ScheduleWakeup)
+  blue    agents or a live background shell running (count shown as a badge)
+  mauve   loop scheduled (ScheduleWakeup) while otherwise idle
   orange  waiting for user input (permissions / ask menu)
   red     error (usage limit, API error)       [pulses]
 """
@@ -39,8 +39,9 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/stat
 DEFAULT_PORT = 7717
 LOOP_GRACE = 120  # ponytail: mauve lingers this long past a scheduled wakeup
 AGENT_TTL = 2 * 3600  # ponytail: SubagentStop can be missed on crash; TTL self-heals
-SHELL_TTL = 4 * 3600
-WORKFLOW_TTL = 3600  # ponytail: no completion hook for Workflow — TTL is the only heal
+BUSY_STALE = 300  # busy frozen longer than this = stuck (real turns refresh it) → idle
+WORKFLOW_TTL = 1800  # ponytail: no completion hook — badge/detail only, never a color
+SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
 
 
 # -- shared helpers ---------------------------------------------------------
@@ -78,6 +79,81 @@ def read_state(session_id: str) -> dict:
         return {}
 
 
+def session_pid(session_id: str) -> int | None:
+    """Live pid owning this session, from the session files."""
+    for path in (CLAUDE_DIR / "sessions").glob("*.json"):
+        try:
+            d = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if d.get("sessionId") == session_id and pid_alive(d.get("pid", 0)):
+            return d.get("pid")
+    return None
+
+
+def _proc_table() -> dict[int, tuple[int, str, str]]:
+    """pid -> (ppid, comm, starttime) in one /proc pass."""
+    tab: dict[int, tuple[int, str, str]] = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            data = open(f"/proc/{name}/stat").read()
+            comm = data[data.index("(") + 1:data.rindex(")")]
+            rest = data[data.rindex(")") + 1:].split()
+            tab[int(name)] = (int(rest[1]), comm, rest[19])
+        except (OSError, ValueError, IndexError):
+            continue
+    return tab
+
+
+def _descendants(root: int, tab: dict) -> list[int]:
+    kids: dict[int, list[int]] = {}
+    for pid, (ppid, _, _) in tab.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, stack = [], list(kids.get(root, []))
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(kids.get(p, []))
+    return out
+
+
+def _ancestors(pid: int, tab: dict) -> set[int]:
+    seen: set[int] = set()
+    while pid > 1 and pid in tab and pid not in seen:
+        seen.add(pid)
+        pid = tab[pid][0]
+    return seen
+
+
+def capture_bg_shell(claude_pid: int) -> list | None:
+    """[pid, starttime] of the background shell a Bash tool just launched.
+
+    Runs inside the PostToolUse hook (itself a descendant of claude). The shell
+    spawned *before* the hook did, so after excluding this hook's own process
+    chain, the newest shell descendant of claude is that shell. Precise liveness
+    (pid+starttime) later means the light clears the instant the shell exits —
+    no TTL guessing. ponytail: parallel bg launches in one batch may mis-pick;
+    self-heals as the wrong pid dies.
+    """
+    tab = _proc_table()
+    mine = _ancestors(os.getpid(), tab) | {os.getpid()}
+    best = None
+    for p in _descendants(claude_pid, tab):
+        if p in mine:
+            continue
+        _ppid, comm, start = tab[p]
+        if comm in SHELL_COMMS and (best is None or int(start) > best[0]):
+            best = (int(start), p, start)
+    return [best[1], best[2]] if best else None
+
+
+def shell_alive(entry) -> bool:
+    return (isinstance(entry, (list, tuple)) and len(entry) == 2
+            and pid_alive(entry[0]) and proc_starttime(entry[0]) == entry[1])
+
+
 # -- hook entrypoint --------------------------------------------------------
 
 def cmd_hook() -> None:
@@ -113,8 +189,14 @@ def cmd_hook() -> None:
                     st["loop_until"] = now + min(delay, 3600) + LOOP_GRACE
                 elif tool == "Workflow":
                     workflows.append(now)
-                elif tool == "Bash" and ti.get("run_in_background"):
-                    shells.append(now)
+            elif event == "PostToolUse":
+                # shell exists only after the tool returns — capture its pid now
+                ti = payload.get("tool_input") or {}
+                if payload.get("tool_name") == "Bash" and ti.get("run_in_background"):
+                    cp = session_pid(sid)
+                    sh = capture_bg_shell(cp) if cp else None
+                    if sh:
+                        shells.append(sh)
             elif event == "SubagentStart":
                 agents.append(now)
             elif event == "SubagentStop" and agents:
@@ -131,7 +213,7 @@ def cmd_hook() -> None:
                     st.pop("loop_until", None)  # user took over → not a loop anymore
 
             st["agents"] = [t for t in agents if now - t < AGENT_TTL]
-            st["shells"] = [t for t in shells if now - t < SHELL_TTL]
+            st["shells"] = [s for s in shells if shell_alive(s)]
             st["workflows"] = [t for t in workflows if now - t < WORKFLOW_TTL]
             st["updated"] = now
             tmp = path.with_suffix(".tmp")
@@ -203,59 +285,46 @@ def transcript_error(session_id: str) -> str | None:
     return err
 
 
-def proc_descendants(pid: int) -> bool:
-    """Does the claude process have any live child processes (shells)?"""
-    kids: dict[int, list[int]] = {}
-    try:
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-            try:
-                stat = open(f"/proc/{name}/stat", "rb").read().decode(errors="replace")
-                ppid = int(stat.rsplit(")", 1)[1].split()[1])
-                kids.setdefault(ppid, []).append(int(name))
-            except (OSError, ValueError, IndexError):
-                continue
-    except OSError:
-        return False
-    stack = [pid]
-    while stack:
-        for child in kids.get(stack.pop(), []):
-            return True
-    return False
-
-
 def compute_light(base: str, st: dict, err: str | None,
                   pid: int) -> tuple[str, str, dict]:
+    """Map ground-truth state to a light. Every ephemeral state is re-validated
+    against something we can verify *right now* (a live pid, a fresh status
+    timestamp, an unexpired hook), so no light survives its cause.
+    """
     now = time.time()
-    # prune here too: state can be read long after the last hook wrote it
+    # re-prune on read: state may be scanned long after the last hook wrote it
     agents = [t for t in st.get("agents", []) if now - t < AGENT_TTL]
-    shells = [t for t in st.get("shells", []) if now - t < SHELL_TTL]
     workflows = [t for t in st.get("workflows", []) if now - t < WORKFLOW_TTL]
-    # bg shells have no completion hook — validate against live child processes
-    if shells and not proc_descendants(pid):
-        shells = []
+    # shells are pid-tracked: gone the instant the process dies (no TTL guess)
+    shells = [s for s in st.get("shells", []) if shell_alive(s)]
     counts = {"agents": len(agents), "shells": len(shells),
               "workflows": len(workflows)}
+
+    def parts() -> str:
+        p = []
+        if agents:
+            p.append(f"{len(agents)} agent{'s' if len(agents) > 1 else ''}")
+        if workflows:
+            p.append(f"{len(workflows)} workflow{'s' if len(workflows) > 1 else ''}")
+        if shells:
+            p.append(f"{len(shells)} background shell{'s' if len(shells) > 1 else ''}")
+        return " + ".join(p)
+
     if err:
         return "red", err[:300], counts
     if base == "waiting":
         return "orange", "waiting for your input", counts
-    if st.get("loop_until", 0) > now:
-        return "mauve", "loop running", counts
-    if agents or shells or workflows:
-        parts = []
-        if agents:
-            parts.append(f"{len(agents)} agent{'s' if len(agents) > 1 else ''}")
-        if workflows:
-            parts.append(f"{len(workflows)} workflow{'s' if len(workflows) > 1 else ''}")
-        if shells:
-            parts.append(f"{len(shells)} background shell{'s' if len(shells) > 1 else ''}")
-        return "blue", " + ".join(parts), counts
+    # blue only for things we can prove are alive — agents (SubagentStop) and
+    # pid-tracked shells. Workflows have no completion signal, so they inform the
+    # detail/badge but never drive the color (else they'd stick after finishing).
+    if agents or shells:
+        return "blue", parts(), counts
     if base == "busy":
-        return "busy", "working", counts
+        return "busy", parts() or "working", counts
+    if st.get("loop_until", 0) > now:  # idle, but a wakeup is scheduled
+        return "mauve", parts() or "loop scheduled", counts
     if base == "idle":
-        return "green", "waiting for next prompt", counts
+        return "green", parts() or "waiting for next prompt", counts
     return "gray", base or "unknown", counts
 
 
@@ -281,12 +350,23 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
         sid = data.get("sessionId", "")
         st = read_state(sid)
         hook_err = st.get("error")
+        # self-heal red: if the session reported a fresh status after the error,
+        # it recovered — don't wait on a UserPromptSubmit/Stop hook that may miss.
+        status_ts = (data.get("statusUpdatedAt") or 0) / 1000
+        if hook_err and status_ts > hook_err.get("ts", 0) + 1:
+            hook_err = None
         if hook_err:
             err = f"{hook_err.get('type', 'error')}: {hook_err.get('msg', '')}".strip(": ")
         else:
             # fallback: sessions started before hooks were installed
             err = transcript_error(sid)
-        light, detail, counts = compute_light(data.get("status") or "", st, err, pid)
+        status = data.get("status") or ""
+        # a live turn refreshes statusUpdatedAt constantly; a "busy" frozen far
+        # past any real turn means the session file is stuck (killed/suspended
+        # UI, crash mid-turn) — don't blink amber forever, treat it as idle.
+        if status == "busy" and status_ts and time.time() - status_ts > BUSY_STALE:
+            status = "idle"
+        light, detail, counts = compute_light(status, st, err, pid)
         entry = {
             "id": sid,
             "pid": pid,
@@ -296,7 +376,7 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             "version": data.get("version", ""),
             "startedAt": data.get("startedAt", 0),
             "updatedAt": data.get("statusUpdatedAt") or data.get("updatedAt", 0),
-            "status": data.get("status") or "unknown",
+            "status": status or "unknown",
             "light": light,
             "detail": detail,
             "agents": counts["agents"],
@@ -687,7 +767,8 @@ def hook_entries() -> dict[str, list[dict]]:
     hook = {"type": "command", "command": cmd, "timeout": 10}
     rule = [{"hooks": [hook]}]
     return {
-        "PreToolUse": [{"matcher": "Bash|ScheduleWakeup|CronCreate|Workflow", "hooks": [hook]}],
+        "PreToolUse": [{"matcher": "ScheduleWakeup|CronCreate|Workflow", "hooks": [hook]}],
+        "PostToolUse": [{"matcher": "Bash", "hooks": [hook]}],
         "SubagentStart": rule,
         "SubagentStop": rule,
         "StopFailure": rule,
