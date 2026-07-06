@@ -11,7 +11,7 @@
 
 Usage:
   claudetell.py [overlay]             native always-on-top overlay (default)
-  claudetell.py serve [--port 7717]   browser version (http://127.0.0.1:7717)
+  claudetell.py serve [--host 127.0.0.1] [--port 7717]   browser version
   claudetell.py hook                  hook entrypoint (stdin JSON from Claude Code)
   claudetell.py install               register hooks in ~/.claude/settings.json
   claudetell.py uninstall             remove them
@@ -418,10 +418,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def cmd_serve(port: int, show_all: bool) -> None:
+def cmd_serve(port: int, show_all: bool, host: str = "127.0.0.1") -> None:
     Handler.show_all = show_all
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"claudetell overlay: http://127.0.0.1:{port}")
+    server = ThreadingHTTPServer((host, port), Handler)
+    shown = host if host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+    print(f"claudetell overlay: http://{shown}:{port}")
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        print("warning: bound to a non-loopback address — the page has no auth "
+              "and exposes session names, cwds and pids to anyone who can reach "
+              "it. Prefer 127.0.0.1 + an SSH tunnel (ssh -L).")
     print("tip: open it in Chrome/Chromium and hit the ⧉ button for an "
           "always-on-top picture-in-picture overlay")
     try:
@@ -1039,7 +1044,8 @@ def main() -> None:
         cmd_overlay()
     elif cmd == "serve":
         port = int(args[args.index("--port") + 1]) if "--port" in args else DEFAULT_PORT
-        cmd_serve(port, "--all" in args)
+        host = args[args.index("--host") + 1] if "--host" in args else "127.0.0.1"
+        cmd_serve(port, "--all" in args, host)
     elif cmd == "install":
         cmd_install()
     elif cmd == "uninstall":

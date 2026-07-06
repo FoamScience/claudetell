@@ -36,7 +36,9 @@ top right. All choices persist.
 
 Browser version also exists — `uv run claudetell.py serve` →
 http://127.0.0.1:7717, with a ⧉ button for a Chrome picture-in-picture
-always-on-top window.
+always-on-top window. `--host` and `--port` override the bind address
+(default loopback; it has no auth, so keep it on 127.0.0.1 and reach it over an
+SSH tunnel — `ssh -L 7717:127.0.0.1:7717` — rather than binding 0.0.0.0).
 
 PEP 723 script, zero dependencies. `[tool.uv] python-preference = "only-system"`
 keeps the script on the distro python whose ABI matches the distro-packaged
