@@ -236,9 +236,11 @@ def _tmux_client_pids(sock: str | None, pane: str) -> list[int]:
 def _kitty_focus(pids: set[int]) -> bool:
     """Focus the kitty window whose process tree contains one of pids, via
     kitty's remote-control IPC (works on Wayland, unlike xdotool)."""
-    socks = ([os.environ["KITTY_LISTEN_ON"]] if os.environ.get("KITTY_LISTEN_ON")
-             else ["unix:" + p for p in glob.glob("/tmp/kitty-*")
-                   if not p.endswith(".lock")])
+    # every kitty instance has its own socket; a session can live in any of
+    # them, so check them all (own socket first), not just KITTY_LISTEN_ON.
+    socks = list(dict.fromkeys(
+        ([os.environ["KITTY_LISTEN_ON"]] if os.environ.get("KITTY_LISTEN_ON") else [])
+        + ["unix:" + p for p in glob.glob("/tmp/kitty-*") if not p.endswith(".lock")]))
     for sock in socks:
         try:
             ls = subprocess.run(["kitten", "@", "--to", sock, "ls"],
@@ -295,7 +297,8 @@ def focus_session(entry: dict) -> None:
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError):
                 pass
-        pids += _tmux_client_pids(sock, pane)
+        for cp in _tmux_client_pids(sock, pane):  # client → its kitty window shell
+            pids += _ancestor_chain(cp)
     pid = entry.get("pid", 0)
     if pid:
         pids += _ancestor_chain(pid)
