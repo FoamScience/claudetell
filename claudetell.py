@@ -12,6 +12,7 @@
 Usage:
   claudetell.py [overlay]             native always-on-top overlay (default)
   claudetell.py serve [--host 127.0.0.1] [--port 7717]   browser version
+  claudetell.py focus <query>         focus a session's window/pane (bind to a key)
   claudetell.py hook                  hook entrypoint (stdin JSON from Claude Code)
   claudetell.py install               register hooks in ~/.claude/settings.json
   claudetell.py uninstall             remove them
@@ -27,8 +28,10 @@ Lights:
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import os
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -152,6 +155,166 @@ def capture_bg_shell(claude_pid: int) -> list | None:
 def shell_alive(entry) -> bool:
     return (isinstance(entry, (list, tuple)) and len(entry) == 2
             and pid_alive(entry[0]) and proc_starttime(entry[0]) == entry[1])
+
+
+# -- session identity + focus ------------------------------------------------
+
+# shape = coarse per-project bucket, letter = fine id. Web draws all six as SVG;
+# GTK can only bucket border-radius into three, so the letter is the real
+# cross-renderer identity anchor (see GTK_SHAPE below).
+SHAPES = ("circle", "square", "triangle", "diamond", "pentagon", "hexagon")
+
+
+def session_shape(key: str) -> str:
+    h = 0
+    for ch in key or "":
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return SHAPES[h % len(SHAPES)]
+
+
+def session_letter(name: str) -> str:
+    for ch in name or "":
+        if ch.isalnum():
+            return ch.upper()
+    return "?"
+
+
+_env_cache: dict[int, tuple[str | None, str | None, str | None]] = {}
+
+
+def session_tmux(pid: int) -> tuple[str | None, str | None]:
+    """(TMUX_PANE, tmux socket) from the session process's environ, cached.
+    environ is fixed at exec, so (pid, starttime) is a safe cache key."""
+    st = proc_starttime(pid)
+    cached = _env_cache.get(pid)
+    if cached and cached[0] == st:
+        return cached[1], cached[2]
+    pane = sock = None
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read()
+        for kv in raw.split(b"\0"):
+            k, _, v = kv.partition(b"=")
+            if k == b"TMUX_PANE":
+                pane = v.decode("utf-8", "replace")
+            elif k == b"TMUX":  # <socket>,<server-pid>,<session-n>
+                sock = v.decode("utf-8", "replace").split(",")[0] or None
+    except OSError:
+        pass
+    _env_cache[pid] = (st, pane, sock)
+    return pane, sock
+
+
+def _ancestor_chain(pid: int) -> list[int]:
+    """[pid, parent, grandparent, ...] up to init — nearest first."""
+    tab = _proc_table()
+    chain, seen = [], set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        chain.append(pid)
+        if pid not in tab:
+            break
+        pid = tab[pid][0]
+    return chain
+
+
+def _tmux_client_pids(sock: str | None, pane: str) -> list[int]:
+    """PIDs of terminals with a client attached to this pane's session — those
+    are the GUI windows worth focusing (a detached session has none)."""
+    base = ["tmux"] + (["-S", sock] if sock else [])
+    try:
+        sess = subprocess.run(base + ["display-message", "-p", "-t", pane,
+                                      "#{session_id}"], capture_output=True,
+                              text=True, timeout=2).stdout.strip()
+        out = subprocess.run(base + ["list-clients", "-t", sess, "-F",
+                                     "#{client_pid}"], capture_output=True,
+                             text=True, timeout=2).stdout
+        return [int(x) for x in out.split() if x.isdigit()]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def _kitty_focus(pids: set[int]) -> bool:
+    """Focus the kitty window whose process tree contains one of pids, via
+    kitty's remote-control IPC (works on Wayland, unlike xdotool)."""
+    socks = ([os.environ["KITTY_LISTEN_ON"]] if os.environ.get("KITTY_LISTEN_ON")
+             else ["unix:" + p for p in glob.glob("/tmp/kitty-*")
+                   if not p.endswith(".lock")])
+    for sock in socks:
+        try:
+            ls = subprocess.run(["kitten", "@", "--to", sock, "ls"],
+                                capture_output=True, text=True, timeout=2)
+            data = json.loads(ls.stdout)
+        except (OSError, ValueError, json.JSONDecodeError,
+                subprocess.SubprocessError):
+            continue
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for w in tab.get("windows", []):
+                    tree = {w.get("pid")} | {p.get("pid")
+                            for p in w.get("foreground_processes", [])}
+                    if tree & pids:
+                        subprocess.run(["kitten", "@", "--to", sock, "focus-window",
+                                        "--match", f"id:{w['id']}"], timeout=2,
+                                       check=False, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                        return True
+    return False
+
+
+def _xdotool_focus(pids: list[int]) -> None:
+    """X11 fallback for non-kitty terminals. ponytail: no-op on Wayland."""
+    if not os.environ.get("DISPLAY"):
+        return
+    for anc in pids:  # nearest ancestor with a window wins
+        try:
+            out = subprocess.run(["xdotool", "search", "--pid", str(anc)],
+                                 capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            return  # no xdotool — give up silently
+        wins = out.stdout.split()
+        if wins:
+            try:
+                subprocess.run(["xdotool", "windowactivate", wins[-1]], timeout=2,
+                               check=False, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return
+
+
+def focus_session(entry: dict) -> None:
+    """Focus the tmux pane + terminal GUI window hosting a session (same
+    machine). tmux switches the pane; kitty IPC (or xdotool) raises the window."""
+    pane, sock = entry.get("pane"), entry.get("tmux_sock")
+    pids = []
+    if pane:
+        base = ["tmux"] + (["-S", sock] if sock else [])
+        for sub in (["select-window", "-t", pane], ["select-pane", "-t", pane]):
+            try:
+                subprocess.run(base + sub, timeout=2, check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        pids += _tmux_client_pids(sock, pane)
+    pid = entry.get("pid", 0)
+    if pid:
+        pids += _ancestor_chain(pid)
+    if pids and not _kitty_focus(set(pids)):
+        _xdotool_focus(pids)
+
+
+def cmd_focus(query: str) -> None:
+    """Focus a session by letter, name, or cwd substring — bind this to a key
+    via your desktop's keyboard settings (Wayland won't let apps grab one)."""
+    q = query.strip().lower()
+    if not q:
+        sys.exit("usage: claudetell.py focus <letter|name|cwd-substring>")
+    for s in scan_sessions(show_all=True):
+        if q == s["letter"].lower() or q in s["name"].lower() \
+                or q in s["cwd"].lower():
+            focus_session(s)
+            return
+    sys.exit(f"no live session matching {query!r}")
 
 
 # -- hook entrypoint --------------------------------------------------------
@@ -376,11 +539,17 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             if not fresh:
                 status = "idle"
         light, detail, counts = compute_light(status, st, err, pid)
+        pane, tmux_sock = session_tmux(pid)
+        name = data.get("name") or Path(data.get("cwd", "?")).name
         entry = {
             "id": sid,
             "pid": pid,
-            "name": data.get("name") or Path(data.get("cwd", "?")).name,
+            "name": name,
             "cwd": data.get("cwd", ""),
+            "shape": session_shape(data.get("cwd") or sid),
+            "letter": session_letter(name),
+            "pane": pane,
+            "tmux_sock": tmux_sock,
             "kind": data.get("kind", ""),
             "version": data.get("version", ""),
             "startedAt": data.get("startedAt", 0),
@@ -423,6 +592,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:
+        # only the session id crosses the wire; the pane/socket handed to tmux
+        # come from server-side scan data, never from the client — no shell.
+        if self.path.startswith("/api/focus"):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                sid = json.loads(self.rfile.read(length) or b"{}").get("id")
+            except (ValueError, json.JSONDecodeError):
+                sid = None
+            hit = next((s for s in scan_sessions(self.show_all)
+                        if s["id"] == sid), None) if sid else None
+            if hit:
+                focus_session(hit)
+            self.send_response(204 if hit else 404)
+            self.end_headers()
+            return
+        self.send_error(404)
+
     def log_message(self, *args) -> None:
         pass
 
@@ -453,6 +640,9 @@ LIGHT_RGB = {
     "gray": (0x58, 0x5B, 0x70),
 }
 PULSE_PERIOD = {"busy": 1.6, "blue": 2.2, "mauve": 2.2, "orange": 1.1, "red": 0.8}
+GTK_SHAPE = {"circle": "shape-round", "hexagon": "shape-round",
+             "square": "shape-sq", "diamond": "shape-sq",
+             "triangle": "shape-soft", "pentagon": "shape-soft"}
 LIGHT_PX = 24
 OVERLAY_CFG = STATE_DIR / "overlay.json"
 
@@ -463,6 +653,13 @@ def _overlay_css() -> bytes:
         "window.claudetell { background: rgba(30,30,46,0.88);"
         " border-radius: 13px; border: 1px solid rgba(69,71,90,0.9); }",
         ".light { border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }",
+        # shape = coarse identity bucket; GTK CSS has no polygon, so six shapes
+        # collapse to three radii (see GTK_SHAPE). The letter disambiguates.
+        ".light.shape-round { border-radius: 999px; }",
+        ".light.shape-soft { border-radius: 8px; }",
+        ".light.shape-sq { border-radius: 2px; }",
+        ".ltr { color: rgba(0,0,0,0.72); font-weight: 700; font-size: 10px;"
+        " text-shadow: 0 1px 1px rgba(255,255,255,0.25); }",
         ".badge { background: rgba(30,30,46,0.95); color: #cdd6f4;"
         " font-size: 8px; font-weight: 700; padding: 0 2px; border-radius: 999px;"
         " border: 1px solid rgba(69,71,90,0.9); margin: 0 -2px -2px 0; }",
@@ -593,6 +790,12 @@ def cmd_overlay() -> None:
             ctx.remove_class(name)
         ctx.add_class(light if light in LIGHT_RGB else "gray")
 
+    def set_shape(ebox, shape: str) -> None:
+        ctx = ebox._dot.get_style_context()
+        for cls in ("shape-round", "shape-soft", "shape-sq"):
+            ctx.remove_class(cls)
+        ctx.add_class(GTK_SHAPE.get(shape, "shape-round"))
+
     def set_badge(ebox, s: dict) -> None:
         bg = s.get("bg", 0)
         if bg > 0:
@@ -605,6 +808,10 @@ def cmd_overlay() -> None:
         dot = Gtk.Box()
         dot.set_size_request(LIGHT_PX, LIGHT_PX)
         dot.get_style_context().add_class("light")
+        letter = Gtk.Label()
+        letter.get_style_context().add_class("ltr")
+        letter.set_halign(Gtk.Align.CENTER)
+        letter.set_valign(Gtk.Align.CENTER)
         badge = Gtk.Label()
         badge.get_style_context().add_class("badge")
         badge.set_halign(Gtk.Align.END)
@@ -612,6 +819,8 @@ def cmd_overlay() -> None:
         badge.set_no_show_all(True)  # show_all() must not force it visible
         overlay = Gtk.Overlay()
         overlay.add(dot)
+        overlay.add_overlay(letter)
+        overlay.set_overlay_pass_through(letter, True)  # clicks fall through
         overlay.add_overlay(badge)
         overlay.set_overlay_pass_through(badge, True)  # clicks fall through to ebox
         ebox = Gtk.EventBox(visible_window=False)
@@ -619,6 +828,7 @@ def cmd_overlay() -> None:
         ebox.set_has_tooltip(True)
         ebox._s = s
         ebox._dot = dot
+        ebox._letter = letter
         ebox._badge = badge
 
         def tooltip(_w, _x, _y, _kb, tip):
@@ -636,7 +846,8 @@ def cmd_overlay() -> None:
 
         ebox.connect("query-tooltip", tooltip)
 
-        # click on a light = show its info; drag (>4px) still moves the window
+        # click on a light = focus its pane/terminal; drag (>4px) moves the
+        # window; info still shows on hover via the tooltip.
         press = [None]
 
         def light_press(_w, event):
@@ -657,7 +868,7 @@ def cmd_overlay() -> None:
         def light_release(_w, _event):
             if press[0]:
                 press[0] = None
-                ebox.trigger_tooltip_query()
+                focus_session(ebox._s)
             return True
 
         ebox.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
@@ -682,6 +893,8 @@ def cmd_overlay() -> None:
                 changed = True
             el._s = s
             set_light_class(el, s["light"])
+            set_shape(el, s.get("shape", "circle"))
+            el._letter.set_text(s.get("letter", "?"))
             set_badge(el, s)
         for sid in list(lights):
             if sid not in seen:
@@ -875,15 +1088,20 @@ HTML = r"""<!doctype html>
   #lights.grid { display: grid; grid-template-columns: repeat(4, 1fr); }
   .light {
     position: relative;
-    width: 22px; height: 22px; border-radius: 50%; cursor: default;
-    border: 1px solid rgba(255,255,255,.15);
-    background: radial-gradient(circle at 35% 30%,
-      color-mix(in srgb, var(--c) 70%, white) 0%, var(--c) 55%,
-      color-mix(in srgb, var(--c) 60%, black) 100%);
-    box-shadow: 0 0 8px 1px color-mix(in srgb, var(--c) 60%, transparent),
-                inset 0 -2px 4px rgba(0,0,0,.25);
+    width: 22px; height: 22px; cursor: pointer;
     transition: transform .15s;
   }
+  .light svg { position: absolute; inset: 0; width: 100%; height: 100%;
+    overflow: visible;
+    filter: drop-shadow(0 0 5px color-mix(in srgb, var(--c) 55%, transparent)); }
+  .light svg :is(circle, rect, polygon) {
+    fill: var(--c); stroke: rgba(255,255,255,.28); stroke-width: 1;
+    stroke-linejoin: round; }
+  .light .ltr {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: rgba(0,0,0,.68);
+    text-shadow: 0 1px 1px rgba(255,255,255,.28); pointer-events: none; }
   .light:hover { transform: scale(1.18); }
   .light.green  { --c: var(--green); }
   .light.busy   { --c: var(--busy);   animation: pulse 1.6s ease-in-out infinite; }
@@ -969,6 +1187,26 @@ function showTip(el, s) {
 }
 function esc(t) { const d = document.createElement("i"); d.textContent = t ?? ""; return d.innerHTML; }
 
+const POLY = {
+  triangle: "12,1 23,21 1,21",
+  diamond: "12,1 23,12 12,23 1,12",
+  pentagon: "12,1 22.5,8.6 18.5,20.9 5.5,20.9 1.5,8.6",
+  hexagon: "12,1 21.5,6.5 21.5,17.5 12,23 2.5,17.5 2.5,6.5",
+};
+function shapeSvg(shape) {
+  if (shape === "circle") return '<circle cx="12" cy="12" r="11"/>';
+  if (shape === "square") return '<rect x="2" y="2" width="20" height="20" rx="3"/>';
+  return `<polygon points="${POLY[shape] || POLY.hexagon}"/>`;
+}
+async function focusSession(id) {
+  try {
+    await fetch(ORIGIN + "/api/focus", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  } catch (e) { /* server gone or not same-machine */ }
+}
+
 function render(data) {
   sessions = data.sessions;
   document.getElementById("count").textContent = sessions.length || "";
@@ -978,8 +1216,10 @@ function render(data) {
     let el = nodes.get(s.id);
     if (!el) {
       el = document.createElement("div");
+      el.innerHTML = `<svg viewBox="0 0 24 24">${shapeSvg(s.shape)}</svg>`
+                   + `<span class="ltr">${esc(s.letter)}</span>`;
       el.addEventListener("mouseenter", () => showTip(el, el._s));
-      el.addEventListener("click", () => showTip(el, el._s));
+      el.addEventListener("click", () => focusSession(el._s.id));
       el.addEventListener("mouseleave", () => tip.style.display = "none");
       nodes.set(s.id, el);
     }
@@ -1049,6 +1289,8 @@ def main() -> None:
     cmd = args[0] if args else "overlay"
     if cmd == "hook":
         cmd_hook()
+    elif cmd == "focus":
+        cmd_focus(args[1] if len(args) > 1 else "")
     elif cmd == "overlay":
         cmd_overlay()
     elif cmd == "serve":

@@ -1,7 +1,18 @@
 # claudetell
 
 Traffic-light overlay for running Claude Code sessions. One light per session,
-hover for details (name, folder, pid, uptime, state).
+hover for details (name, folder, pid, uptime, state). Click a light to jump to
+that session's terminal ([Focus](#focus-a-session)).
+
+**Colour** is the state (below). **Shape + letter** is the identity, so you can
+tell sessions apart at a glance and keep track of which is which:
+
+- **Letter** — the session's initial (folder name), centred in the light. This
+  is the stable identity, identical in the overlay and the browser view.
+- **Shape** — a per-project bucket derived from the folder path, so a project
+  always looks the same. The browser draws six (circle, square, triangle,
+  diamond, pentagon, hexagon); the GTK overlay has no polygons in CSS, so it
+  buckets those into three rounded forms — the letter carries the fine detail.
 
 | light | meaning |
 |---|---|
@@ -39,6 +50,52 @@ http://127.0.0.1:7717, with a ⧉ button for a Chrome picture-in-picture
 always-on-top window. `--host` and `--port` override the bind address
 (default loopback; it has no auth, so keep it on 127.0.0.1 and reach it over an
 SSH tunnel — `ssh -L 7717:127.0.0.1:7717` — rather than binding 0.0.0.0).
+
+## Focus a session
+
+Jump to the terminal a session is running in — its tmux pane is selected and
+the terminal window is raised.
+
+- **Click** a light (overlay or browser). Left-drag still moves the overlay; a
+  click that doesn't drag focuses.
+- **Keyboard shortcut** — `claudetell.py focus <query>`, where `<query>` matches
+  a session's letter, name, or folder substring (first live match wins):
+
+  ```sh
+  uv run claudetell.py focus C            # by letter
+  uv run claudetell.py focus centripump   # by name / folder
+  ```
+
+  Wayland won't let an app grab a global hotkey (the compositor owns them), so
+  bind the command yourself: **GNOME Settings → Keyboard → Keyboard Shortcuts →
+  Custom Shortcuts**, command `python3 /path/to/claudetell.py focus C`, and pick
+  a key. Because letters are stable, `Super+C` → the centripump session reads
+  naturally. (Other desktops: use their custom-shortcut tool the same way.)
+
+How it raises the window, in order:
+
+1. **tmux** — `select-window` + `select-pane` on the pane (captured from the
+   session process's `TMUX_PANE`). This alone is enough when that terminal is
+   already visible.
+2. **kitty** — via kitty's remote-control IPC (`kitten @ focus-window`), which
+   works on Wayland. Requires kitty remote control enabled
+   (`allow_remote_control yes` + a `listen_on` socket in `kitty.conf`).
+3. **xdotool** — X11 fallback for other terminals; a no-op on Wayland.
+
+Same-machine only — the overlay/server must run where the sessions and display
+are (so it's a no-op reaching a `serve` instance over an SSH tunnel).
+
+**GNOME Wayland caveat.** Mutter's focus-stealing prevention often refuses to
+raise the window to the foreground: the tab/pane still switches underneath, but
+you get a "window is ready" notification instead of the window coming forward.
+There is no code or `gsettings` fix (no activation token is available to hand
+the terminal). Workarounds, best first: (1) use the **keyboard shortcut** rather
+than clicking — commands GNOME launches itself can carry an activation token
+that a click on the non-focusable overlay can't; (2) install a GNOME **extension
+that disables focus-stealing prevention** (search extensions.gnome.org for
+"focus"); (3) the "is ready" notification is clickable and raises the window.
+Clicking works for every session state (idle, busy, error, …) — the switch is
+always issued; only the raise is subject to this policy.
 
 PEP 723 script, zero dependencies. `[tool.uv] python-preference = "only-system"`
 keeps the script on the distro python whose ABI matches the distro-packaged
