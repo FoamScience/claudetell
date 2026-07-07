@@ -39,7 +39,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/stat
 DEFAULT_PORT = 7717
 LOOP_GRACE = 120  # ponytail: mauve lingers this long past a scheduled wakeup
 AGENT_TTL = 2 * 3600  # ponytail: SubagentStop can be missed on crash; TTL self-heals
-BUSY_STALE = 300  # busy frozen longer than this = stuck (real turns refresh it) → idle
+BUSY_STALE = 300  # "busy" with no transcript write this long = stuck → idle
 WORKFLOW_TTL = 1800  # ponytail: no completion hook — badge/detail only, never a color
 SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
 
@@ -361,11 +361,20 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             # fallback: sessions started before hooks were installed
             err = transcript_error(sid)
         status = data.get("status") or ""
-        # a live turn refreshes statusUpdatedAt constantly; a "busy" frozen far
-        # past any real turn means the session file is stuck (killed/suspended
-        # UI, crash mid-turn) — don't blink amber forever, treat it as idle.
-        if status == "busy" and status_ts and time.time() - status_ts > BUSY_STALE:
-            status = "idle"
+        # statusUpdatedAt only stamps the busy transition, NOT each turn step, so
+        # a long turn looks "stale" by it. A live turn writes to the transcript
+        # every few seconds; no write for BUSY_STALE means the session is stuck
+        # (killed/suspended UI, crash mid-turn) — treat it as idle, not amber.
+        # ponytail: a single tool call running >BUSY_STALE with no output can
+        # false-idle; widen BUSY_STALE if that bites.
+        if status == "busy":
+            tp = find_transcript(sid)
+            try:
+                fresh = bool(tp) and time.time() - tp.stat().st_mtime < BUSY_STALE
+            except OSError:
+                fresh = False
+            if not fresh:
+                status = "idle"
         light, detail, counts = compute_light(status, st, err, pid)
         entry = {
             "id": sid,
