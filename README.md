@@ -85,17 +85,25 @@ How it raises the window, in order:
 Same-machine only — the overlay/server must run where the sessions and display
 are (so it's a no-op reaching a `serve` instance over an SSH tunnel).
 
-**GNOME Wayland caveat.** Mutter's focus-stealing prevention often refuses to
-raise the window to the foreground: the tab/pane still switches underneath, but
-you get a "window is ready" notification instead of the window coming forward.
-There is no code or `gsettings` fix (no activation token is available to hand
-the terminal). Workarounds, best first: (1) use the **keyboard shortcut** rather
-than clicking — commands GNOME launches itself can carry an activation token
-that a click on the non-focusable overlay can't; (2) install a GNOME **extension
-that disables focus-stealing prevention** (search extensions.gnome.org for
-"focus"); (3) the "is ready" notification is clickable and raises the window.
-Clicking works for every session state (idle, busy, error, …) — the switch is
-always issued; only the raise is subject to this policy.
+**GNOME Wayland caveat.** Mutter's focus-stealing prevention refuses to raise a
+window that isn't already focused: the tmux window/pane still switches
+underneath, but you get a "window is ready" notification instead of the terminal
+coming forward. It bites hardest when the target lives in a *different* kitty
+instance than the one you're looking at. There is no code or `gsettings` fix (no
+activation token is available to hand the terminal) — the raise must be unblocked
+on the GNOME side. Options:
+
+- **Install a "steal focus" extension** (the real fix). It turns the
+  window-demands-attention signal into an immediate raise. A GNOME 45–46+ one:
+  [steal-my-focus-window](https://github.com/v-dimitrov/gnome-shell-extension-stealmyfocus)
+  — clone into `~/.local/share/gnome-shell/extensions/` under its exact uuid
+  folder `steal-my-focus-window@steal-my-focus-window`, log out and back in
+  (Wayland needs a full session restart to load a new extension), then
+  `gnome-extensions enable steal-my-focus-window@steal-my-focus-window`.
+- **Click the "is ready" notification** — it raises the window, zero install.
+
+Clicking works for every session state (idle, busy, error, …) and switches the
+tmux window/pane regardless; only the GUI raise is subject to this policy.
 
 PEP 723 script, zero dependencies. `[tool.uv] python-preference = "only-system"`
 keeps the script on the distro python whose ABI matches the distro-packaged

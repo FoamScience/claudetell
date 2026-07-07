@@ -291,7 +291,17 @@ def focus_session(entry: dict) -> None:
     pids = []
     if pane:
         base = ["tmux"] + (["-S", sock] if sock else [])
-        for sub in (["select-window", "-t", pane], ["select-pane", "-t", pane]):
+        try:
+            clients = subprocess.run(base + ["list-clients", "-F", "#{client_name}"],
+                                     capture_output=True, text=True,
+                                     timeout=2).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            clients = []
+        # several tmux sessions can share one client showing one at a time, so
+        # select-pane alone won't change the displayed session — switch-client does.
+        cmds = [["switch-client", "-c", c, "-t", pane] for c in clients]
+        cmds += [["select-window", "-t", pane], ["select-pane", "-t", pane]]
+        for sub in cmds:
             try:
                 subprocess.run(base + sub, timeout=2, check=False,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
