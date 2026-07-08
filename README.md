@@ -41,7 +41,9 @@ Native frameless GTK3 window: always-on-top, on all workspaces, no taskbar
 entry, single instance. Runs via XWayland (`GDK_BACKEND=x11`) because GNOME
 Wayland doesn't let clients request keep-above. Hover a light for details;
 right-click for layout (horizontal / vertical / grid), position (screen
-corners — the panel re-anchors as lights come and go — or free) and quit.
+corners — the panel re-anchors as lights come and go — or free), panel opacity
+(transparent / medium / opaque — the frame goes translucent so you can see what's
+behind it, lights stay solid) and quit.
 Left-drag moves it anywhere and switches position to free. Defaults: vertical,
 top right. All choices persist.
 

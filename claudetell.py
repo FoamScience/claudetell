@@ -417,8 +417,8 @@ def find_transcript(session_id: str) -> Path | None:
     return None
 
 
-ERROR_MARKERS = ("usage limit", "rate limit", "api error", "overloaded",
-                 "credit balance", "oauth token has expired")
+ERROR_MARKERS = ("usage limit", "rate limit", "session limit", "api error",
+                 "overloaded", "credit balance", "oauth token has expired")
 
 
 def transcript_error(session_id: str) -> str | None:
@@ -445,6 +445,10 @@ def transcript_error(session_id: str) -> str | None:
             continue
         etype = entry.get("type")
         if etype not in ("assistant", "user", "system"):
+            continue
+        # null system markers (no level, no content) trail real entries — they
+        # aren't messages, so skip them and keep looking back for the real one.
+        if etype == "system" and not entry.get("level") and not entry.get("content"):
             continue
         if etype == "assistant" and entry.get("isApiErrorMessage"):
             content = (entry.get("message") or {}).get("content") or []
@@ -660,10 +664,12 @@ LIGHT_PX = 24
 OVERLAY_CFG = STATE_DIR / "overlay.json"
 
 
-def _overlay_css() -> bytes:
-    """GTK CSS for the whole overlay — avoids cairo (python3-gi-cairo often absent)."""
+def _overlay_css(alpha: float = 0.6) -> bytes:
+    """GTK CSS for the whole overlay — avoids cairo (python3-gi-cairo often absent).
+    alpha = panel background opacity (lights stay solid so you can see through the
+    frame to what's behind it)."""
     rules = [
-        "window.claudetell { background: rgba(30,30,46,0.88);"
+        f"window.claudetell {{ background: rgba(30,30,46,{alpha:.2f});"
         " border-radius: 13px; border: 1px solid rgba(69,71,90,0.9); }",
         ".light { border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }",
         # shape = coarse identity bucket; GTK CSS has no polygon, so six shapes
@@ -743,7 +749,7 @@ def cmd_overlay() -> None:
         win.set_visual(rgba)
 
     provider = Gtk.CssProvider()
-    provider.load_from_data(_overlay_css())
+    provider.load_from_data(_overlay_css(cfg.get("opacity", 0.6)))
     Gtk.StyleContext.add_provider_for_screen(
         screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     win.get_style_context().add_class("claudetell")
@@ -946,6 +952,11 @@ def cmd_overlay() -> None:
         place()
         save_cfg()
 
+    def pick_opacity(v: float) -> None:
+        cfg["opacity"] = v
+        provider.load_from_data(_overlay_css(v))  # live: re-styles in place
+        save_cfg()
+
     add_radios((("h", "Horizontal"), ("v", "Vertical"), ("grid", "Grid")),
                cfg.get("layout", "v"), pick_layout)
     menu.append(Gtk.SeparatorMenuItem())
@@ -954,6 +965,9 @@ def cmd_overlay() -> None:
          ("bl", "Bottom left"), ("br", "Bottom right"),
          ("free", "Free (drag)")),
         cfg.get("anchor", "tr"), pick_anchor)
+    menu.append(Gtk.SeparatorMenuItem())
+    add_radios(((0.3, "Transparent"), (0.6, "Medium"), (0.85, "Opaque")),
+               cfg.get("opacity", 0.6), pick_opacity)
     menu.append(Gtk.SeparatorMenuItem())
     quit_item = Gtk.MenuItem(label="Quit claudetell")
     quit_item.connect("activate", Gtk.main_quit)
