@@ -291,16 +291,26 @@ def focus_session(entry: dict) -> None:
     pids = []
     if pane:
         base = ["tmux"] + (["-S", sock] if sock else [])
-        try:
-            clients = subprocess.run(base + ["list-clients", "-F", "#{client_name}"],
-                                     capture_output=True, text=True,
-                                     timeout=2).stdout.split()
-        except (OSError, subprocess.SubprocessError):
-            clients = []
-        # several tmux sessions can share one client showing one at a time, so
-        # select-pane alone won't change the displayed session — switch-client does.
-        cmds = [["switch-client", "-c", c, "-t", pane] for c in clients]
-        cmds += [["select-window", "-t", pane], ["select-pane", "-t", pane]]
+
+        def tmux_out(args):
+            try:
+                return subprocess.run(base + args, capture_output=True, text=True,
+                                      timeout=2).stdout.split()
+            except (OSError, subprocess.SubprocessError):
+                return []
+
+        # If a client already displays this pane's session, just position the
+        # window/pane there — never touch clients viewing OTHER sessions (that
+        # would yank every terminal to the clicked session). Only when the
+        # session is detached do we switch a single client to show it.
+        sess = " ".join(tmux_out(["display-message", "-p", "-t", pane,
+                                   "#{session_id}"]))
+        cmds = [["select-window", "-t", pane], ["select-pane", "-t", pane]]
+        if sess and not tmux_out(["list-clients", "-t", sess, "-F",
+                                  "#{client_name}"]):
+            spare = tmux_out(["list-clients", "-F", "#{client_name}"])
+            if spare:
+                cmds.insert(0, ["switch-client", "-c", spare[0], "-t", pane])
         for sub in cmds:
             try:
                 subprocess.run(base + sub, timeout=2, check=False,
