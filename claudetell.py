@@ -25,6 +25,7 @@ Lights:
   orange  waiting for user input (permissions / ask menu)
   red     error (usage limit, API error)       [pulses]
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -38,7 +39,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "claudetell"
+STATE_DIR = (
+    Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    / "claudetell"
+)
 DEFAULT_PORT = 7717
 LOOP_GRACE = 120  # ponytail: mauve lingers this long past a scheduled wakeup
 AGENT_TTL = 2 * 3600  # ponytail: SubagentStop can be missed on crash; TTL self-heals
@@ -48,6 +52,7 @@ SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
 
 
 # -- shared helpers ---------------------------------------------------------
+
 
 def pid_alive(pid: int) -> bool:
     if pid <= 1:
@@ -102,8 +107,8 @@ def _proc_table() -> dict[int, tuple[int, str, str]]:
             continue
         try:
             data = open(f"/proc/{name}/stat").read()
-            comm = data[data.index("(") + 1:data.rindex(")")]
-            rest = data[data.rindex(")") + 1:].split()
+            comm = data[data.index("(") + 1 : data.rindex(")")]
+            rest = data[data.rindex(")") + 1 :].split()
             tab[int(name)] = (int(rest[1]), comm, rest[19])
         except (OSError, ValueError, IndexError):
             continue
@@ -153,23 +158,44 @@ def capture_bg_shell(claude_pid: int) -> list | None:
 
 
 def shell_alive(entry) -> bool:
-    return (isinstance(entry, (list, tuple)) and len(entry) == 2
-            and pid_alive(entry[0]) and proc_starttime(entry[0]) == entry[1])
+    return (
+        isinstance(entry, (list, tuple))
+        and len(entry) == 2
+        and pid_alive(entry[0])
+        and proc_starttime(entry[0]) == entry[1]
+    )
 
 
 # -- session identity + focus ------------------------------------------------
 
-# shape = coarse per-project bucket, letter = fine id. Web draws all six as SVG;
-# GTK can only bucket border-radius into three, so the letter is the real
-# cross-renderer identity anchor (see GTK_SHAPE below).
-SHAPES = ("circle", "square", "triangle", "diamond", "pentagon", "hexagon")
+# shape = per-cwd bucket (same folder → same shape), cycled so distinct projects
+# get distinct shapes. Silhouettes are per-corner border-radius (top-left,
+# top-right, bottom-right, bottom-left) — both GTK and the web view render these
+# natively, so ~12 clearly-distinct shapes with no SVG polygons or cairo.
+SHAPE_RADIUS = {
+    "circle": "999px",
+    "square": "2px",
+    "rounded": "8px",
+    "arch": "999px 999px 2px 2px",
+    "keystone": "2px 2px 999px 999px",
+    "d-left": "999px 2px 2px 999px",
+    "d-right": "2px 999px 999px 2px",
+    "drop": "999px 2px 999px 999px",
+    "drop-alt": "999px 999px 999px 2px",
+    "fan": "2px 999px 2px 2px",
+    "leaf": "999px 2px 999px 2px",
+    "leaf-alt": "2px 999px 2px 999px",
+}
+SHAPES = tuple(SHAPE_RADIUS)
 
 
-def session_shape(key: str) -> str:
-    h = 0
-    for ch in key or "":
-        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
-    return SHAPES[h % len(SHAPES)]
+def assign_shapes(keys: list[str]) -> list[str]:
+    """Cycle shapes across distinct keys (cwds): same key → same shape, new keys
+    get the next shape round-robin. Collides only past len(SHAPES) distinct keys."""
+    order: dict[str, int] = {}
+    for k in keys:
+        order.setdefault(k, len(order))
+    return [SHAPES[order[k] % len(SHAPES)] for k in keys]
 
 
 def session_letter(name: str) -> str:
@@ -222,12 +248,18 @@ def _tmux_client_pids(sock: str | None, pane: str) -> list[int]:
     are the GUI windows worth focusing (a detached session has none)."""
     base = ["tmux"] + (["-S", sock] if sock else [])
     try:
-        sess = subprocess.run(base + ["display-message", "-p", "-t", pane,
-                                      "#{session_id}"], capture_output=True,
-                              text=True, timeout=2).stdout.strip()
-        out = subprocess.run(base + ["list-clients", "-t", sess, "-F",
-                                     "#{client_pid}"], capture_output=True,
-                             text=True, timeout=2).stdout
+        sess = subprocess.run(
+            base + ["display-message", "-p", "-t", pane, "#{session_id}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+        out = subprocess.run(
+            base + ["list-clients", "-t", sess, "-F", "#{client_pid}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout
         return [int(x) for x in out.split() if x.isdigit()]
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
@@ -238,27 +270,53 @@ def _kitty_focus(pids: set[int]) -> bool:
     kitty's remote-control IPC (works on Wayland, unlike xdotool)."""
     # every kitty instance has its own socket; a session can live in any of
     # them, so check them all (own socket first), not just KITTY_LISTEN_ON.
-    socks = list(dict.fromkeys(
-        ([os.environ["KITTY_LISTEN_ON"]] if os.environ.get("KITTY_LISTEN_ON") else [])
-        + ["unix:" + p for p in glob.glob("/tmp/kitty-*") if not p.endswith(".lock")]))
+    socks = list(
+        dict.fromkeys(
+            (
+                [os.environ["KITTY_LISTEN_ON"]]
+                if os.environ.get("KITTY_LISTEN_ON")
+                else []
+            )
+            + [
+                "unix:" + p
+                for p in glob.glob("/tmp/kitty-*")
+                if not p.endswith(".lock")
+            ]
+        )
+    )
     for sock in socks:
         try:
-            ls = subprocess.run(["kitten", "@", "--to", sock, "ls"],
-                                capture_output=True, text=True, timeout=2)
+            ls = subprocess.run(
+                ["kitten", "@", "--to", sock, "ls"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
             data = json.loads(ls.stdout)
-        except (OSError, ValueError, json.JSONDecodeError,
-                subprocess.SubprocessError):
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
             continue
         for osw in data:
             for tab in osw.get("tabs", []):
                 for w in tab.get("windows", []):
-                    tree = {w.get("pid")} | {p.get("pid")
-                            for p in w.get("foreground_processes", [])}
+                    tree = {w.get("pid")} | {
+                        p.get("pid") for p in w.get("foreground_processes", [])
+                    }
                     if tree & pids:
-                        subprocess.run(["kitten", "@", "--to", sock, "focus-window",
-                                        "--match", f"id:{w['id']}"], timeout=2,
-                                       check=False, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
+                        subprocess.run(
+                            [
+                                "kitten",
+                                "@",
+                                "--to",
+                                sock,
+                                "focus-window",
+                                "--match",
+                                f"id:{w['id']}",
+                            ],
+                            timeout=2,
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
                         return True
     return False
 
@@ -269,16 +327,24 @@ def _xdotool_focus(pids: list[int]) -> None:
         return
     for anc in pids:  # nearest ancestor with a window wins
         try:
-            out = subprocess.run(["xdotool", "search", "--pid", str(anc)],
-                                 capture_output=True, text=True, timeout=2)
+            out = subprocess.run(
+                ["xdotool", "search", "--pid", str(anc)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
         except (OSError, subprocess.SubprocessError):
             return  # no xdotool — give up silently
         wins = out.stdout.split()
         if wins:
             try:
-                subprocess.run(["xdotool", "windowactivate", wins[-1]], timeout=2,
-                               check=False, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    ["xdotool", "windowactivate", wins[-1]],
+                    timeout=2,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except (OSError, subprocess.SubprocessError):
                 pass
             return
@@ -294,8 +360,9 @@ def focus_session(entry: dict) -> None:
 
         def tmux_out(args):
             try:
-                return subprocess.run(base + args, capture_output=True, text=True,
-                                      timeout=2).stdout.split()
+                return subprocess.run(
+                    base + args, capture_output=True, text=True, timeout=2
+                ).stdout.split()
             except (OSError, subprocess.SubprocessError):
                 return []
 
@@ -303,18 +370,23 @@ def focus_session(entry: dict) -> None:
         # window/pane there — never touch clients viewing OTHER sessions (that
         # would yank every terminal to the clicked session). Only when the
         # session is detached do we switch a single client to show it.
-        sess = " ".join(tmux_out(["display-message", "-p", "-t", pane,
-                                   "#{session_id}"]))
+        sess = " ".join(
+            tmux_out(["display-message", "-p", "-t", pane, "#{session_id}"])
+        )
         cmds = [["select-window", "-t", pane], ["select-pane", "-t", pane]]
-        if sess and not tmux_out(["list-clients", "-t", sess, "-F",
-                                  "#{client_name}"]):
+        if sess and not tmux_out(["list-clients", "-t", sess, "-F", "#{client_name}"]):
             spare = tmux_out(["list-clients", "-F", "#{client_name}"])
             if spare:
                 cmds.insert(0, ["switch-client", "-c", spare[0], "-t", pane])
         for sub in cmds:
             try:
-                subprocess.run(base + sub, timeout=2, check=False,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    base + sub,
+                    timeout=2,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except (OSError, subprocess.SubprocessError):
                 pass
         for cp in _tmux_client_pids(sock, pane):  # client → its kitty window shell
@@ -333,14 +405,14 @@ def cmd_focus(query: str) -> None:
     if not q:
         sys.exit("usage: claudetell.py focus <letter|name|cwd-substring>")
     for s in scan_sessions(show_all=True):
-        if q == s["letter"].lower() or q in s["name"].lower() \
-                or q in s["cwd"].lower():
+        if q == s["letter"].lower() or q in s["name"].lower() or q in s["cwd"].lower():
             focus_session(s)
             return
     sys.exit(f"no live session matching {query!r}")
 
 
 # -- hook entrypoint --------------------------------------------------------
+
 
 def cmd_hook() -> None:
     """Update per-session state from a Claude Code hook event. Never fails."""
@@ -427,8 +499,15 @@ def find_transcript(session_id: str) -> Path | None:
     return None
 
 
-ERROR_MARKERS = ("usage limit", "rate limit", "session limit", "api error",
-                 "overloaded", "credit balance", "oauth token has expired")
+ERROR_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "session limit",
+    "api error",
+    "overloaded",
+    "credit balance",
+    "oauth token has expired",
+)
 
 
 def transcript_error(session_id: str) -> str | None:
@@ -475,8 +554,9 @@ def transcript_error(session_id: str) -> str | None:
     return err
 
 
-def compute_light(base: str, st: dict, err: str | None,
-                  pid: int) -> tuple[str, str, dict]:
+def compute_light(
+    base: str, st: dict, err: str | None, pid: int
+) -> tuple[str, str, dict]:
     """Map ground-truth state to a light. Every ephemeral state is re-validated
     against something we can verify *right now* (a live pid, a fresh status
     timestamp, an unexpired hook), so no light survives its cause.
@@ -487,8 +567,7 @@ def compute_light(base: str, st: dict, err: str | None,
     workflows = [t for t in st.get("workflows", []) if now - t < WORKFLOW_TTL]
     # shells are pid-tracked: gone the instant the process dies (no TTL guess)
     shells = [s for s in st.get("shells", []) if shell_alive(s)]
-    counts = {"agents": len(agents), "shells": len(shells),
-              "workflows": len(workflows)}
+    counts = {"agents": len(agents), "shells": len(shells), "workflows": len(workflows)}
 
     def parts() -> str:
         p = []
@@ -546,7 +625,9 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
         if hook_err and status_ts > hook_err.get("ts", 0) + 1:
             hook_err = None
         if hook_err:
-            err = f"{hook_err.get('type', 'error')}: {hook_err.get('msg', '')}".strip(": ")
+            err = f"{hook_err.get('type', 'error')}: {hook_err.get('msg', '')}".strip(
+                ": "
+            )
         else:
             # fallback: sessions started before hooks were installed
             err = transcript_error(sid)
@@ -573,7 +654,6 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             "pid": pid,
             "name": name,
             "cwd": data.get("cwd", ""),
-            "shape": session_shape(data.get("cwd") or sid),
             "letter": session_letter(name),
             "pane": pane,
             "tmux_sock": tmux_sock,
@@ -593,18 +673,23 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
         cur = best.get(sid)
         if cur is None or entry["updatedAt"] >= cur["updatedAt"]:
             best[sid] = entry
-    return sorted(best.values(), key=lambda s: s["startedAt"])
+    result = sorted(best.values(), key=lambda s: s["startedAt"])
+    for s, shape in zip(result, assign_shapes([s["cwd"] or s["id"] for s in result])):
+        s["shape"] = shape
+    return result
 
 
 # -- server -----------------------------------------------------------------
+
 
 class Handler(BaseHTTPRequestHandler):
     show_all = False
 
     def do_GET(self) -> None:
         if self.path.startswith("/api/sessions"):
-            body = json.dumps({"now": time.time() * 1000,
-                               "sessions": scan_sessions(self.show_all)}).encode()
+            body = json.dumps(
+                {"now": time.time() * 1000, "sessions": scan_sessions(self.show_all)}
+            ).encode()
             ctype = "application/json"
         elif self.path == "/" or self.path.startswith("/index"):
             body = HTML.encode()
@@ -628,8 +713,11 @@ class Handler(BaseHTTPRequestHandler):
                 sid = json.loads(self.rfile.read(length) or b"{}").get("id")
             except (ValueError, json.JSONDecodeError):
                 sid = None
-            hit = next((s for s in scan_sessions(self.show_all)
-                        if s["id"] == sid), None) if sid else None
+            hit = (
+                next((s for s in scan_sessions(self.show_all) if s["id"] == sid), None)
+                if sid
+                else None
+            )
             if hit:
                 focus_session(hit)
             self.send_response(204 if hit else 404)
@@ -647,11 +735,15 @@ def cmd_serve(port: int, show_all: bool, host: str = "127.0.0.1") -> None:
     shown = host if host not in ("0.0.0.0", "::", "") else "127.0.0.1"
     print(f"claudetell overlay: http://{shown}:{port}")
     if host not in ("127.0.0.1", "::1", "localhost"):
-        print("warning: bound to a non-loopback address — the page has no auth "
-              "and exposes session names, cwds and pids to anyone who can reach "
-              "it. Prefer 127.0.0.1 + an SSH tunnel (ssh -L).")
-    print("tip: open it in Chrome/Chromium and hit the ⧉ button for an "
-          "always-on-top picture-in-picture overlay")
+        print(
+            "warning: bound to a non-loopback address — the page has no auth "
+            "and exposes session names, cwds and pids to anyone who can reach "
+            "it. Prefer 127.0.0.1 + an SSH tunnel (ssh -L)."
+        )
+    print(
+        "tip: open it in Chrome/Chromium and hit the ⧉ button for an "
+        "always-on-top picture-in-picture overlay"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -661,15 +753,15 @@ def cmd_serve(port: int, show_all: bool, host: str = "127.0.0.1") -> None:
 # -- native overlay (GTK3) ----------------------------------------------------
 
 LIGHT_RGB = {
-    "green": (0x4A, 0xDE, 0x80), "busy": (0xFB, 0xBF, 0x24),
-    "blue": (0x60, 0xA5, 0xFA), "mauve": (0xCB, 0xA6, 0xF7),
-    "orange": (0xFB, 0x92, 0x3C), "red": (0xF8, 0x71, 0x71),
+    "green": (0x4A, 0xDE, 0x80),
+    "busy": (0xFB, 0xBF, 0x24),
+    "blue": (0x60, 0xA5, 0xFA),
+    "mauve": (0xCB, 0xA6, 0xF7),
+    "orange": (0xFB, 0x92, 0x3C),
+    "red": (0xF8, 0x71, 0x71),
     "gray": (0x58, 0x5B, 0x70),
 }
 PULSE_PERIOD = {"busy": 1.6, "blue": 2.2, "mauve": 2.2, "orange": 1.1, "red": 0.8}
-GTK_SHAPE = {"circle": "shape-round", "hexagon": "shape-round",
-             "square": "shape-sq", "diamond": "shape-sq",
-             "triangle": "shape-soft", "pentagon": "shape-soft"}
 LIGHT_PX = 24
 OVERLAY_CFG = STATE_DIR / "overlay.json"
 
@@ -682,13 +774,14 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
         f"window.claudetell {{ background: rgba(30,30,46,{alpha:.2f});"
         " border-radius: 13px; border: 1px solid rgba(69,71,90,0.9); }",
         ".light { border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }",
-        # shape = coarse identity bucket; GTK CSS has no polygon, so six shapes
-        # collapse to three radii (see GTK_SHAPE). The letter disambiguates.
-        ".light.shape-round { border-radius: 999px; }",
-        ".light.shape-soft { border-radius: 8px; }",
-        ".light.shape-sq { border-radius: 2px; }",
+        # per-cwd shape = per-corner border-radius silhouette (see SHAPE_RADIUS).
+        *(
+            f".light.shape-{name} {{ border-radius: {r}; }}"
+            for name, r in SHAPE_RADIUS.items()
+        ),
         ".ltr { color: rgba(0,0,0,0.72); font-weight: 700; font-size: 10px;"
         " text-shadow: 0 1px 1px rgba(255,255,255,0.25); }",
+        ".name { color: #cdd6f4; font-size: 11px; }",
         ".badge { background: rgba(30,30,46,0.95); color: #cdd6f4;"
         " font-size: 8px; font-weight: 700; padding: 0 2px; border-radius: 999px;"
         " border: 1px solid rgba(69,71,90,0.9); margin: 0 -2px -2px 0; }",
@@ -697,12 +790,16 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
     ]
     for name, (r, g, b) in LIGHT_RGB.items():
         col = f"#{r:02x}{g:02x}{b:02x}"
-        anim = (f" animation: ctpulse {PULSE_PERIOD[name]}s ease-in-out infinite;"
-                if name in PULSE_PERIOD else "")
+        anim = (
+            f" animation: ctpulse {PULSE_PERIOD[name]}s ease-in-out infinite;"
+            if name in PULSE_PERIOD
+            else ""
+        )
         rules.append(
             f".light.{name} {{ background-color: {col};"
             f" box-shadow: 0 0 8px 1px alpha({col}, 0.55),"
-            f" inset 0 -2px 4px rgba(0,0,0,0.3);{anim} }}")
+            f" inset 0 -2px 4px rgba(0,0,0,0.3);{anim} }}"
+        )
     return "\n".join(rules).encode()
 
 
@@ -729,10 +826,12 @@ def cmd_overlay() -> None:
             sys.path.append("/usr/lib/python3/dist-packages")
             import gi
         gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk, Gdk, GLib
+        from gi.repository import Gtk, Gdk, GLib, Pango
     except (ImportError, ValueError):
-        sys.exit("GTK3 not available (apt install python3-gi gir1.2-gtk-3.0) — "
-                 "or use: claudetell.py serve")
+        sys.exit(
+            "GTK3 not available (apt install python3-gi gir1.2-gtk-3.0) — "
+            "or use: claudetell.py serve"
+        )
 
     # single instance — a second overlay just shows every light twice
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -761,12 +860,17 @@ def cmd_overlay() -> None:
     provider = Gtk.CssProvider()
     provider.load_from_data(_overlay_css(cfg.get("opacity", 0.6)))
     Gtk.StyleContext.add_provider_for_screen(
-        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
     win.get_style_context().add_class("claudetell")
 
-    flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
-                       orientation=Gtk.Orientation.HORIZONTAL,
-                       column_spacing=8, row_spacing=8, homogeneous=True)
+    flow = Gtk.FlowBox(
+        selection_mode=Gtk.SelectionMode.NONE,
+        orientation=Gtk.Orientation.HORIZONTAL,
+        column_spacing=8,
+        row_spacing=8,
+        homogeneous=True,
+    )
     box = Gtk.Box(margin=10)
     box.add(flow)
     win.add(box)
@@ -821,9 +925,9 @@ def cmd_overlay() -> None:
 
     def set_shape(ebox, shape: str) -> None:
         ctx = ebox._dot.get_style_context()
-        for cls in ("shape-round", "shape-soft", "shape-sq"):
-            ctx.remove_class(cls)
-        ctx.add_class(GTK_SHAPE.get(shape, "shape-round"))
+        for name in SHAPE_RADIUS:
+            ctx.remove_class(f"shape-{name}")
+        ctx.add_class(f"shape-{shape if shape in SHAPE_RADIUS else 'circle'}")
 
     def set_badge(ebox, s: dict) -> None:
         bg = s.get("bg", 0)
@@ -852,22 +956,35 @@ def cmd_overlay() -> None:
         overlay.set_overlay_pass_through(letter, True)  # clicks fall through
         overlay.add_overlay(badge)
         overlay.set_overlay_pass_through(badge, True)  # clicks fall through to ebox
+        # name label beside the dot (hidden unless "Show names"): a single letter
+        # can't tell 15 similarly-named sessions apart; a few chars of the name can.
+        name = Gtk.Label(xalign=0)
+        name.get_style_context().add_class("name")
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        name.set_max_width_chars(20)
+        name.set_no_show_all(True)  # visibility driven by cfg["labels"], not show_all
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        row.pack_start(overlay, False, False, 0)
+        row.pack_start(name, False, False, 0)
         ebox = Gtk.EventBox(visible_window=False)
-        ebox.add(overlay)
+        ebox.add(row)
         ebox.set_has_tooltip(True)
         ebox._s = s
         ebox._dot = dot
         ebox._letter = letter
+        ebox._name = name
         ebox._badge = badge
 
         def tooltip(_w, _x, _y, _kb, tip):
             sess = ebox._s
             esc = GLib.markup_escape_text
-            lines = [f"<b>{esc(sess['name'])}</b>",
-                     f"<tt>{esc(sess['cwd'])}</tt>",
-                     f"{esc(sess['light'])} · {esc(sess['status'])}",
-                     f"pid {sess['pid']} · up {_fmt_age(sess['startedAt'])}"
-                     f" · changed {_fmt_age(sess['updatedAt'])} ago"]
+            lines = [
+                f"<b>{esc(sess['name'])}</b>",
+                f"<tt>{esc(sess['cwd'])}</tt>",
+                f"{esc(sess['light'])} · {esc(sess['status'])}",
+                f"pid {sess['pid']} · up {_fmt_age(sess['startedAt'])}"
+                f" · changed {_fmt_age(sess['updatedAt'])} ago",
+            ]
             if sess.get("detail"):
                 lines.append(esc(sess["detail"]))
             tip.set_markup("\n".join(lines))
@@ -886,8 +1003,10 @@ def cmd_overlay() -> None:
             return on_press(_w, event)
 
         def light_motion(_w, event):
-            if press[0] and (abs(event.x_root - press[0][0]) > 4
-                             or abs(event.y_root - press[0][1]) > 4):
+            if press[0] and (
+                abs(event.x_root - press[0][0]) > 4
+                or abs(event.y_root - press[0][1]) > 4
+            ):
                 x, y, t = press[0]
                 press[0] = None
                 anchor_items["free"].set_active(True)
@@ -900,9 +1019,11 @@ def cmd_overlay() -> None:
                 focus_session(ebox._s)
             return True
 
-        ebox.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
-                        | Gdk.EventMask.BUTTON_RELEASE_MASK
-                        | Gdk.EventMask.BUTTON1_MOTION_MASK)
+        ebox.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.BUTTON1_MOTION_MASK
+        )
         ebox.connect("button-press-event", light_press)
         ebox.connect("motion-notify-event", light_motion)
         ebox.connect("button-release-event", light_release)
@@ -924,6 +1045,8 @@ def cmd_overlay() -> None:
             set_light_class(el, s["light"])
             set_shape(el, s.get("shape", "circle"))
             el._letter.set_text(s.get("letter", "?"))
+            el._name.set_text(s.get("name", ""))
+            el._name.set_visible(cfg.get("labels", True))
             set_badge(el, s)
         for sid in list(lights):
             if sid not in seen:
@@ -947,8 +1070,7 @@ def cmd_overlay() -> None:
             else:
                 group = item
             item.set_active(current == key)
-            item.connect("activate",
-                         lambda it, k=key: it.get_active() and on_pick(k))
+            item.connect("activate", lambda it, k=key: it.get_active() and on_pick(k))
             menu.append(item)
             items[key] = item
         return items
@@ -967,17 +1089,42 @@ def cmd_overlay() -> None:
         provider.load_from_data(_overlay_css(v))  # live: re-styles in place
         save_cfg()
 
-    add_radios((("h", "Horizontal"), ("v", "Vertical"), ("grid", "Grid")),
-               cfg.get("layout", "v"), pick_layout)
+    add_radios(
+        (("h", "Horizontal"), ("v", "Vertical"), ("grid", "Grid")),
+        cfg.get("layout", "v"),
+        pick_layout,
+    )
     menu.append(Gtk.SeparatorMenuItem())
     anchor_items = add_radios(
-        (("tl", "Top left"), ("tr", "Top right"),
-         ("bl", "Bottom left"), ("br", "Bottom right"),
-         ("free", "Free (drag)")),
-        cfg.get("anchor", "tr"), pick_anchor)
+        (
+            ("tl", "Top left"),
+            ("tr", "Top right"),
+            ("bl", "Bottom left"),
+            ("br", "Bottom right"),
+            ("free", "Free (drag)"),
+        ),
+        cfg.get("anchor", "tr"),
+        pick_anchor,
+    )
     menu.append(Gtk.SeparatorMenuItem())
-    add_radios(((0.3, "Transparent"), (0.6, "Medium"), (0.85, "Opaque")),
-               cfg.get("opacity", 0.6), pick_opacity)
+    add_radios(
+        ((0.3, "Transparent"), (0.6, "Medium"), (0.85, "Opaque")),
+        cfg.get("opacity", 0.6),
+        pick_opacity,
+    )
+    menu.append(Gtk.SeparatorMenuItem())
+
+    def toggle_labels(item) -> None:
+        cfg["labels"] = item.get_active()
+        for el in lights.values():
+            el._name.set_visible(cfg["labels"])
+        win.resize(1, 1)  # shrink-wrap to the new width
+        save_cfg()
+
+    labels_item = Gtk.CheckMenuItem(label="Show names")
+    labels_item.set_active(cfg.get("labels", True))
+    labels_item.connect("toggled", toggle_labels)
+    menu.append(labels_item)
     menu.append(Gtk.SeparatorMenuItem())
     quit_item = Gtk.MenuItem(label="Quit claudetell")
     quit_item.connect("activate", Gtk.main_quit)
@@ -990,8 +1137,7 @@ def cmd_overlay() -> None:
             return True
         if event.button == 1:
             anchor_items["free"].set_active(True)  # drag implies free placement
-            win.begin_move_drag(1, int(event.x_root), int(event.y_root),
-                                event.time)
+            win.begin_move_drag(1, int(event.x_root), int(event.y_root), event.time)
             return True
         return False
 
@@ -1010,8 +1156,11 @@ def cmd_overlay() -> None:
     # re-anchor whenever content size changes (lights added/removed, layout)
     win.connect("size-allocate", lambda _w, a: place(a.width, a.height))
     win.show_all()
-    if cfg.get("anchor", "tr") == "free" and isinstance(cfg.get("pos"), list) \
-            and len(cfg["pos"]) == 2:
+    if (
+        cfg.get("anchor", "tr") == "free"
+        and isinstance(cfg.get("pos"), list)
+        and len(cfg["pos"]) == 2
+    ):
         win.move(*cfg["pos"])
     else:
         place()
@@ -1031,7 +1180,9 @@ def hook_entries() -> dict[str, list[dict]]:
     hook = {"type": "command", "command": cmd, "timeout": 10}
     rule = [{"hooks": [hook]}]
     return {
-        "PreToolUse": [{"matcher": "ScheduleWakeup|CronCreate|Workflow", "hooks": [hook]}],
+        "PreToolUse": [
+            {"matcher": "ScheduleWakeup|CronCreate|Workflow", "hooks": [hook]}
+        ],
         "PostToolUse": [{"matcher": "Bash", "hooks": [hook]}],
         "SubagentStart": rule,
         "SubagentStop": rule,
@@ -1126,14 +1277,16 @@ HTML = r"""<!doctype html>
   .light {
     position: relative;
     width: 22px; height: 22px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.15);
+    background: radial-gradient(circle at 35% 30%,
+      color-mix(in srgb, var(--c) 70%, white) 0%, var(--c) 55%,
+      color-mix(in srgb, var(--c) 60%, black) 100%);
+    box-shadow: 0 0 8px 1px color-mix(in srgb, var(--c) 60%, transparent),
+                inset 0 -2px 4px rgba(0,0,0,.25);
     transition: transform .15s;
   }
-  .light svg { position: absolute; inset: 0; width: 100%; height: 100%;
-    overflow: visible;
-    filter: drop-shadow(0 0 5px color-mix(in srgb, var(--c) 55%, transparent)); }
-  .light svg :is(circle, rect, polygon) {
-    fill: var(--c); stroke: rgba(255,255,255,.28); stroke-width: 1;
-    stroke-linejoin: round; }
+  /* per-cwd shape silhouettes (per-corner border-radius), injected below */
+SHAPE_CSS
   .light .ltr {
     position: absolute; inset: 0; display: flex;
     align-items: center; justify-content: center;
@@ -1224,17 +1377,6 @@ function showTip(el, s) {
 }
 function esc(t) { const d = document.createElement("i"); d.textContent = t ?? ""; return d.innerHTML; }
 
-const POLY = {
-  triangle: "12,1 23,21 1,21",
-  diamond: "12,1 23,12 12,23 1,12",
-  pentagon: "12,1 22.5,8.6 18.5,20.9 5.5,20.9 1.5,8.6",
-  hexagon: "12,1 21.5,6.5 21.5,17.5 12,23 2.5,17.5 2.5,6.5",
-};
-function shapeSvg(shape) {
-  if (shape === "circle") return '<circle cx="12" cy="12" r="11"/>';
-  if (shape === "square") return '<rect x="2" y="2" width="20" height="20" rx="3"/>';
-  return `<polygon points="${POLY[shape] || POLY.hexagon}"/>`;
-}
 async function focusSession(id) {
   try {
     await fetch(ORIGIN + "/api/focus", {
@@ -1253,15 +1395,14 @@ function render(data) {
     let el = nodes.get(s.id);
     if (!el) {
       el = document.createElement("div");
-      el.innerHTML = `<svg viewBox="0 0 24 24">${shapeSvg(s.shape)}</svg>`
-                   + `<span class="ltr">${esc(s.letter)}</span>`;
+      el.innerHTML = `<span class="ltr">${esc(s.letter)}</span>`;
       el.addEventListener("mouseenter", () => showTip(el, el._s));
       el.addEventListener("click", () => focusSession(el._s.id));
       el.addEventListener("mouseleave", () => tip.style.display = "none");
       nodes.set(s.id, el);
     }
     el._s = s;
-    el.className = "light " + s.light;
+    el.className = "light shape-" + s.shape + " " + s.light;
     let badge = el.querySelector(".badge");
     if (s.bg > 0) {
       if (!badge) { badge = document.createElement("span"); badge.className = "badge"; el.appendChild(badge); }
@@ -1319,6 +1460,14 @@ tick();
 </body>
 </html>
 """
+
+HTML = HTML.replace(
+    "SHAPE_CSS",
+    "\n".join(
+        f"  .light.shape-{name} {{ border-radius: {r}; }}"
+        for name, r in SHAPE_RADIUS.items()
+    ),
+)
 
 
 def main() -> None:

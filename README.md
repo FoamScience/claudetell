@@ -4,15 +4,17 @@ Traffic-light overlay for running Claude Code sessions. One light per session,
 hover for details (name, folder, pid, uptime, state). Click a light to jump to
 that session's terminal ([Focus](#focus-a-session)).
 
-**Colour** is the state (below). **Shape + letter** is the identity, so you can
-tell sessions apart at a glance and keep track of which is which:
+**Colour** is the state (below). Identity is the name, shape, and a letter:
 
-- **Letter** — the session's initial (folder name), centred in the light. This
-  is the stable identity, identical in the overlay and the browser view.
-- **Shape** — a per-project bucket derived from the folder path, so a project
-  always looks the same. The browser draws six (circle, square, triangle,
-  diamond, pentagon, hexagon); the GTK overlay has no polygons in CSS, so it
-  buckets those into three rounded forms — the letter carries the fine detail.
+- **Name** — the GTK overlay shows the full session name beside each light (on
+  by default; right-click → *Show names* to toggle). A single letter can't tell
+  15 similarly-named sessions apart; the name can.
+- **Shape** — shared by all sessions in the same folder (cwd) and cycled so
+  distinct folders get distinct shapes. Twelve per-corner-radius silhouettes
+  (circle, square, leaf, arch, keystone, D-left/right, teardrop, …) rendered
+  identically in the overlay and browser; wraps only past twelve folders.
+- **Letter** — the session's initial, centred in the light; the compact identity
+  when names are hidden and in the browser view. Full name is always on hover.
 
 | light | meaning |
 |---|---|
@@ -41,7 +43,8 @@ Native frameless GTK3 window: always-on-top, on all workspaces, no taskbar
 entry, single instance. Runs via XWayland (`GDK_BACKEND=x11`) because GNOME
 Wayland doesn't let clients request keep-above. Hover a light for details;
 right-click for layout (horizontal / vertical / grid), position (screen
-corners — the panel re-anchors as lights come and go — or free), panel opacity
+corners — the panel re-anchors as lights come and go — or free), names
+(stem-stripped session name beside each light, on by default), panel opacity
 (transparent / medium / opaque — the frame goes translucent so you can see what's
 behind it, lights stay solid) and quit.
 Left-drag moves it anywhere and switches position to free. Defaults: vertical,
