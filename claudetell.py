@@ -12,6 +12,7 @@
 Usage:
   claudetell.py [overlay]             native always-on-top overlay (default)
   claudetell.py serve [--host 127.0.0.1] [--port 7717]   browser version
+  claudetell.py json [--all]          print live sessions as JSON (used over SSH)
   claudetell.py focus <query>         focus a session's window/pane (bind to a key)
   claudetell.py hook                  hook entrypoint (stdin JSON from Claude Code)
   claudetell.py install               register hooks in ~/.claude/settings.json
@@ -34,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,9 +48,11 @@ STATE_DIR = (
 DEFAULT_PORT = 7717
 LOOP_GRACE = 120  # ponytail: mauve lingers this long past a scheduled wakeup
 AGENT_TTL = 2 * 3600  # ponytail: SubagentStop can be missed on crash; TTL self-heals
-BUSY_STALE = 300  # "busy" with no transcript write this long = stuck → idle
+BUSY_STALE = 300  # "busy" + no transcript write this long → check CPU (tree_busy)
 WORKFLOW_TTL = 1800  # ponytail: no completion hook — badge/detail only, never a color
 SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
+REMOTES_CFG = STATE_DIR / "remotes.json"
+REMOTE_INTERVAL = 5  # seconds between SSH polls of each remote host
 
 
 # -- shared helpers ---------------------------------------------------------
@@ -125,6 +129,36 @@ def _descendants(root: int, tab: dict) -> list[int]:
         out.append(p)
         stack.extend(kids.get(p, []))
     return out
+
+
+CPU_BUSY_TPS = 8  # process-tree CPU ticks/sec above this ⇒ actively computing
+_cpu_cache: dict[int, tuple[float, int]] = {}  # pid -> (monotonic, tree ticks)
+
+
+def _tree_cpu_ticks(pid: int) -> int:
+    """utime+stime summed over the claude process and all its descendants."""
+    tab = _proc_table()
+    total = 0
+    for p in [pid] + _descendants(pid, tab):
+        try:
+            f = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()
+            total += int(f[11]) + int(f[12])
+        except (OSError, IndexError, ValueError):
+            pass
+    return total
+
+
+def tree_busy(pid: int) -> bool:
+    """Is the session's process tree actively burning CPU? Lets a long silent
+    tool (build/sim writing nothing to the transcript) stay 'busy'. Compares CPU
+    ticks between scans; assumes busy until it has two samples (avoids a flicker
+    to idle on the first stale scan). Idle MCP servers sit well under the rate."""
+    now, ticks = time.monotonic(), _tree_cpu_ticks(pid)
+    prev = _cpu_cache.get(pid)
+    _cpu_cache[pid] = (now, ticks)
+    if not prev or now - prev[0] < 0.5:
+        return True
+    return (ticks - prev[1]) / (now - prev[0]) > CPU_BUSY_TPS
 
 
 def _ancestors(pid: int, tab: dict) -> set[int]:
@@ -353,6 +387,8 @@ def _xdotool_focus(pids: list[int]) -> None:
 def focus_session(entry: dict) -> None:
     """Focus the tmux pane + terminal GUI window hosting a session (same
     machine). tmux switches the pane; kitty IPC (or xdotool) raises the window."""
+    if entry.get("remote"):
+        return  # pane/pid live on another machine — its pid may collide locally
     pane, sock = entry.get("pane"), entry.get("tmux_sock")
     pids = []
     if pane:
@@ -636,15 +672,16 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
         # a long turn looks "stale" by it. A live turn writes to the transcript
         # every few seconds; no write for BUSY_STALE means the session is stuck
         # (killed/suspended UI, crash mid-turn) — treat it as idle, not amber.
-        # ponytail: a single tool call running >BUSY_STALE with no output can
-        # false-idle; widen BUSY_STALE if that bites.
+        # A long tool (build/sim) can run >BUSY_STALE writing nothing, so before
+        # demoting a stale-transcript session we check its process tree is still
+        # burning CPU; only a genuinely quiet one falls back to idle.
         if status == "busy":
             tp = find_transcript(sid)
             try:
                 fresh = bool(tp) and time.time() - tp.stat().st_mtime < BUSY_STALE
             except OSError:
                 fresh = False
-            if not fresh:
+            if not fresh and not tree_busy(pid):
                 status = "idle"
         light, detail, counts = compute_light(status, st, err, pid)
         pane, tmux_sock = session_tmux(pid)
@@ -677,6 +714,51 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
     for s, shape in zip(result, assign_shapes([s["cwd"] or s["id"] for s in result])):
         s["shape"] = shape
     return result
+
+
+# -- remote sessions (over SSH) ---------------------------------------------
+
+
+def load_remotes() -> list[dict]:
+    """Configurable hosts to poll over SSH. remotes.json is a JSON list of
+    {"name": "devbox", "ssh": "user@host"} — optional "cmd" (run instead of
+    piping this script), "ssh_opts" (list), "timeout" (seconds)."""
+    try:
+        data = json.loads(REMOTES_CFG.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def fetch_remote(remote: dict, src: str) -> list[dict]:
+    """SSH to a host and run claudetell's json scan there; tag the sessions with
+    the host. The remote computes its own lights (it owns the /proc + transcripts
+    + hook state), so by default we just pipe THIS script to its python3 — no
+    install or version-sync needed. Set "cmd" to run an installed copy instead."""
+    name = remote.get("name") or remote.get("ssh") or "remote"
+    target = remote.get("ssh")
+    if not target:
+        return []
+    opts = remote.get("ssh_opts") or ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+    cmd = remote.get("cmd")
+    argv = ["ssh", *opts, target] + (cmd.split() if cmd else ["python3", "-", "json"])
+    try:
+        out = subprocess.run(
+            argv,
+            input=None if cmd else src,
+            capture_output=True,
+            text=True,
+            timeout=remote.get("timeout", 12),
+        )
+        data = json.loads(out.stdout)
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        return []
+    sessions = data.get("sessions", []) if isinstance(data, dict) else data
+    for s in sessions:
+        s["remote"] = True
+        s["host"] = name
+        s["id"] = f"{name}:{s.get('id', '')}"  # namespace so ids never collide
+    return sessions if isinstance(sessions, list) else []
 
 
 # -- server -----------------------------------------------------------------
@@ -878,6 +960,23 @@ def cmd_overlay() -> None:
     lights: dict[str, Gtk.Widget] = {}
     state = {"empty": None}
 
+    # poll configured remote hosts over SSH off the GTK thread; refresh() merges
+    # the latest cached result. One writer, one reader, atomic list swap → no lock.
+    remote_cache = {"sessions": []}
+    remotes = load_remotes()
+    if remotes:
+        src = Path(__file__).read_text()
+
+        def poll_remotes() -> None:
+            while True:
+                merged = []
+                for r in remotes:
+                    merged += fetch_remote(r, src)
+                remote_cache["sessions"] = merged
+                time.sleep(REMOTE_INTERVAL)
+
+        threading.Thread(target=poll_remotes, daemon=True).start()
+
     def set_empty() -> None:
         if lights and state["empty"]:
             state["empty"].destroy()  # destroys the FlowBoxChild wrapper + label
@@ -978,8 +1077,9 @@ def cmd_overlay() -> None:
         def tooltip(_w, _x, _y, _kb, tip):
             sess = ebox._s
             esc = GLib.markup_escape_text
+            host = f" <i>@{esc(sess['host'])}</i>" if sess.get("host") else ""
             lines = [
-                f"<b>{esc(sess['name'])}</b>",
+                f"<b>{esc(sess['name'])}</b>{host}",
                 f"<tt>{esc(sess['cwd'])}</tt>",
                 f"{esc(sess['light'])} · {esc(sess['status'])}",
                 f"pid {sess['pid']} · up {_fmt_age(sess['startedAt'])}"
@@ -1030,7 +1130,7 @@ def cmd_overlay() -> None:
         return ebox
 
     def refresh() -> bool:
-        sessions = scan_sessions()
+        sessions = scan_sessions() + remote_cache["sessions"]
         seen = set()
         changed = False
         for s in sessions:
@@ -1483,6 +1583,8 @@ def main() -> None:
         port = int(args[args.index("--port") + 1]) if "--port" in args else DEFAULT_PORT
         host = args[args.index("--host") + 1] if "--host" in args else "127.0.0.1"
         cmd_serve(port, "--all" in args, host)
+    elif cmd == "json":
+        print(json.dumps({"sessions": scan_sessions("--all" in args)}))
     elif cmd == "install":
         cmd_install()
     elif cmd == "uninstall":
