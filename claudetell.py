@@ -856,6 +856,9 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
         f"window.claudetell {{ background: rgba(30,30,46,{alpha:.2f});"
         " border-radius: 13px; border: 1px solid rgba(69,71,90,0.9); }",
         ".light { border-radius: 999px; border: 1px solid rgba(255,255,255,0.18); }",
+        # group divider between local and each remote host (see make_separator)
+        "separator.ctsep { background-color: rgba(255,255,255,0.18);"
+        " min-width: 1px; min-height: 1px; margin: 3px; }",
         # per-cwd shape = per-corner border-radius silhouette (see SHAPE_RADIUS).
         *(
             f".light.shape-{name} {{ border-radius: {r}; }}"
@@ -951,14 +954,36 @@ def cmd_overlay() -> None:
         orientation=Gtk.Orientation.HORIZONTAL,
         column_spacing=8,
         row_spacing=8,
-        homogeneous=True,
+        homogeneous=False,  # a spanning separator can't share a 24px light cell
+    )
+    # order lights + group separators by an _order int stamped in refresh()
+    flow.set_sort_func(
+        lambda a, b: getattr(a.get_child(), "_order", 0)
+        - getattr(b.get_child(), "_order", 0)
     )
     box = Gtk.Box(margin=10)
     box.add(flow)
     win.add(box)
 
     lights: dict[str, Gtk.Widget] = {}
+    seps: list[Gtk.Widget] = []
+    NO_GROUP = object()  # sentinel: distinct from any host (incl. local's None)
     state = {"empty": None}
+
+    def make_separator() -> Gtk.Widget:
+        # perpendicular to the flow: a rule across the column in vertical layout,
+        # a divider between lights in horizontal. ponytail: grid gets the vertical
+        # one too — a full-width break can't span flowbox cells.
+        vertical = cfg.get("layout", "v") == "v"
+        sep = Gtk.Separator(
+            orientation=Gtk.Orientation.HORIZONTAL
+            if vertical
+            else Gtk.Orientation.VERTICAL
+        )
+        sep.set_hexpand(vertical)
+        sep.set_vexpand(not vertical)
+        sep.get_style_context().add_class("ctsep")
+        return sep
 
     # poll configured remote hosts over SSH off the GTK thread; refresh() merges
     # the latest cached result. One writer, one reader, atomic list swap → no lock.
@@ -989,7 +1014,8 @@ def cmd_overlay() -> None:
 
     def apply_layout(name: str) -> None:
         n = max(1, len(lights))
-        per_line = {"h": n, "v": 1, "grid": min(4, n)}.get(name, n)
+        total = max(1, len(flow.get_children()))  # lights + group separators
+        per_line = {"h": total, "v": 1, "grid": min(4, n)}.get(name, n)
         flow.set_min_children_per_line(per_line)
         flow.set_max_children_per_line(per_line)
         cfg["layout"] = name
@@ -1129,8 +1155,35 @@ def cmd_overlay() -> None:
         ebox.connect("button-release-event", light_release)
         return ebox
 
+    def regroup(sessions: list) -> None:
+        # rebuild group separators and stamp the flow sort order: local first,
+        # then each remote host, a divider whenever the host changes.
+        for sep in seps:
+            p = sep.get_parent()
+            if p:
+                p.destroy()
+        seps.clear()
+        order = 0
+        prev = NO_GROUP
+        for s in sessions:
+            el = lights.get(s["id"])
+            if el is None:
+                continue
+            grp = s.get("host")  # None → local
+            if prev is not NO_GROUP and grp != prev:
+                sep = make_separator()
+                sep._order = order
+                order += 1
+                flow.add(sep)
+                seps.append(sep)
+            el._order = order
+            order += 1
+            prev = grp
+        flow.invalidate_sort()
+
     def refresh() -> bool:
         sessions = scan_sessions() + remote_cache["sessions"]
+        state["sessions"] = sessions
         seen = set()
         changed = False
         for s in sessions:
@@ -1154,6 +1207,7 @@ def cmd_overlay() -> None:
                 changed = True
         set_empty()
         if changed:
+            regroup(sessions)
             apply_layout(cfg.get("layout", "v"))
         flow.show_all()
         return True
@@ -1176,6 +1230,8 @@ def cmd_overlay() -> None:
         return items
 
     def pick_layout(k: str) -> None:
+        cfg["layout"] = k  # make_separator reads this for divider orientation
+        regroup(state.get("sessions", []))
         apply_layout(k)
         save_cfg()
 
