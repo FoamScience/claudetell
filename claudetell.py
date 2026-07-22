@@ -33,6 +33,7 @@ import fcntl
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -264,6 +265,24 @@ def session_tmux(pid: int) -> tuple[str | None, str | None]:
     return pane, sock
 
 
+def tmux_session_name(sock: str | None, pane: str | None) -> str | None:
+    """tmux session name owning a pane (e.g. '0', 'aporia'). For a remote
+    session this rides across the wire so a local `ssh … tmux a -t <name>`
+    window can be matched to it — many claude sessions can share one tmux
+    session, and the remote session *name* never appears in the local ssh."""
+    if not pane:
+        return None
+    base = ["tmux"] + (["-S", sock] if sock else [])
+    try:
+        out = subprocess.run(
+            base + ["display-message", "-p", "-t", pane, "#{session_name}"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _ancestor_chain(pid: int) -> list[int]:
     """[pid, parent, grandparent, ...] up to init — nearest first."""
     tab = _proc_table()
@@ -299,26 +318,74 @@ def _tmux_client_pids(sock: str | None, pane: str) -> list[int]:
         return []
 
 
+def _kitty_sockets() -> list[str]:
+    """Every kitty remote-control socket (own one first). A session can live in
+    any kitty instance, so callers must check them all, not just KITTY_LISTEN_ON."""
+    return list(
+        dict.fromkeys(
+            ([os.environ["KITTY_LISTEN_ON"]] if os.environ.get("KITTY_LISTEN_ON") else [])
+            + ["unix:" + p for p in glob.glob("/tmp/kitty-*") if not p.endswith(".lock")]
+        )
+    )
+
+
+def _kitty_windows() -> list[dict]:
+    """All kitty windows across all sockets: {sock, id, title, cmd} where cmd is
+    the joined foreground-process cmdlines (holds the ssh target) and title holds
+    what the remote set (e.g. 'host: tmux a -t 0')."""
+    wins = []
+    for sock in _kitty_sockets():
+        try:
+            data = json.loads(subprocess.run(
+                ["kitten", "@", "--to", sock, "ls"],
+                capture_output=True, text=True, timeout=2).stdout)
+        except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+            continue
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for w in tab.get("windows", []):
+                    cmd = " ".join(
+                        " ".join(p.get("cmdline", []))
+                        for p in w.get("foreground_processes", []))
+                    title = f"{w.get('title') or ''} {tab.get('title') or ''}"
+                    wins.append({"sock": sock, "id": w.get("id"),
+                                 "title": title, "cmd": cmd})
+    return wins
+
+
+def _remote_ssh_target(host_name: str) -> str | None:
+    for r in load_remotes():
+        if (r.get("name") or r.get("ssh")) == host_name:
+            return r.get("ssh")
+    return None
+
+
+def _find_ssh_kitty_window(host: str | None, tmux_session: str | None,
+                           name: str | None) -> dict | None:
+    """Local kitty window hosting a remote session's ssh. Narrow by ssh host in
+    the cmdline, then pick the window whose title shows `tmux … -t <session>`
+    (the reliable key — the claude session name isn't in the local ssh). Falls
+    back to the session name in the title, then the sole ssh window to that host."""
+    wins = _kitty_windows()
+    cands = [w for w in wins if host and host in w["cmd"]]
+    if not cands:  # ssh alias not in cmdline → last resort, host string in title
+        cands = [w for w in wins if host and host in w["title"]]
+    if tmux_session:
+        pat = re.compile(r"-t\s+" + re.escape(tmux_session) + r"(?:\s|$)")
+        hit = [w for w in cands if pat.search(w["title"])]
+        if hit:
+            return hit[0]
+    if name:
+        hit = [w for w in cands if name.lower() in w["title"].lower()]
+        if hit:
+            return hit[0]
+    return cands[0] if len(cands) == 1 else None
+
+
 def _kitty_focus(pids: set[int]) -> bool:
     """Focus the kitty window whose process tree contains one of pids, via
     kitty's remote-control IPC (works on Wayland, unlike xdotool)."""
-    # every kitty instance has its own socket; a session can live in any of
-    # them, so check them all (own socket first), not just KITTY_LISTEN_ON.
-    socks = list(
-        dict.fromkeys(
-            (
-                [os.environ["KITTY_LISTEN_ON"]]
-                if os.environ.get("KITTY_LISTEN_ON")
-                else []
-            )
-            + [
-                "unix:" + p
-                for p in glob.glob("/tmp/kitty-*")
-                if not p.endswith(".lock")
-            ]
-        )
-    )
-    for sock in socks:
+    for sock in _kitty_sockets():
         try:
             ls = subprocess.run(
                 ["kitten", "@", "--to", sock, "ls"],
@@ -384,12 +451,65 @@ def _xdotool_focus(pids: list[int]) -> None:
             return
 
 
+def _local_pane_by_name(name: str) -> str | None:
+    """Local tmux pane whose window name or title matches a (remote) session
+    name — the handle for jumping to a session that lives over SSH but is open
+    in a local `ssh` pane. Searches the default tmux server only.
+    ponytail: default socket covers the usual setup; add -S scanning if needed."""
+    q = (name or "").strip().lower()
+    if not q:
+        return None
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{window_name}\t#{pane_title}"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            rows.append((parts[0], parts[1].lower(), parts[2].lower()))
+    for pid_, wn, pt in rows:  # exact window/title match wins
+        if q == wn or q == pt:
+            return pid_
+    for pid_, wn, pt in rows:  # then a substring match
+        if q in wn or q in pt:
+            return pid_
+    return None
+
+
 def focus_session(entry: dict) -> None:
-    """Focus the tmux pane + terminal GUI window hosting a session (same
-    machine). tmux switches the pane; kitty IPC (or xdotool) raises the window."""
+    """Focus the tmux pane + terminal GUI window hosting a session. Local
+    sessions use their own pane/pid; a remote session (over SSH) is matched to
+    the LOCAL tmux pane that hosts it by window/pane name. tmux switches the
+    pane; kitty IPC (or xdotool) raises the window."""
     if entry.get("remote"):
-        return  # pane/pid live on another machine — its pid may collide locally
-    pane, sock = entry.get("pane"), entry.get("tmux_sock")
+        # remote pane/pid live on another machine. The session is open locally
+        # in an `ssh … tmux a -t <sess>` window; find that kitty window (ssh host
+        # from the cmdline, remote tmux session from the title) and raise it.
+        target = _remote_ssh_target(entry.get("host", ""))
+        host = target.split("@")[-1] if target else None
+        win = _find_ssh_kitty_window(host, entry.get("tmux_session"), entry.get("name"))
+        if win:
+            try:
+                subprocess.run(
+                    ["kitten", "@", "--to", win["sock"], "focus-window",
+                     "--match", f"id:{win['id']}"],
+                    timeout=2, check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return
+        # fallback: the ssh runs inside a LOCAL tmux pane named after the session
+        pane, sock, local_pid = _local_pane_by_name(entry.get("name") or ""), None, 0
+        if not pane:
+            return
+    else:
+        pane, sock, local_pid = (
+            entry.get("pane"), entry.get("tmux_sock"), entry.get("pid", 0))
     pids = []
     if pane:
         base = ["tmux"] + (["-S", sock] if sock else [])
@@ -427,9 +547,8 @@ def focus_session(entry: dict) -> None:
                 pass
         for cp in _tmux_client_pids(sock, pane):  # client → its kitty window shell
             pids += _ancestor_chain(cp)
-    pid = entry.get("pid", 0)
-    if pid:
-        pids += _ancestor_chain(pid)
+    if local_pid:
+        pids += _ancestor_chain(local_pid)
     if pids and not _kitty_focus(set(pids)):
         _xdotool_focus(pids)
 
@@ -694,6 +813,7 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             "letter": session_letter(name),
             "pane": pane,
             "tmux_sock": tmux_sock,
+            "tmux_session": tmux_session_name(tmux_sock, pane),
             "kind": data.get("kind", ""),
             "version": data.get("version", ""),
             "startedAt": data.get("startedAt", 0),

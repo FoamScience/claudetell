@@ -63,6 +63,15 @@ the terminal window is raised.
 
 - **Click** a light (overlay or browser). Left-drag still moves the overlay; a
   click that doesn't drag focuses.
+- **Remote sessions** (over SSH) can't be reached by their remote pane/pid, so
+  clicking one jumps to the *local* window hosting its `ssh`. It's matched by the
+  ssh host (from the process cmdline) plus the **remote tmux session** the pane
+  belongs to (the remote reports it as `tmux_session`; the local ssh window shows
+  it in its title, e.g. `host: tmux a -t 0`). Works when many claude sessions
+  share one remote tmux session. kitty windows are raised via kitty IPC; if the
+  ssh instead runs in a *local* tmux pane, that pane (named after the session) is
+  the fallback. Requires the **remote host to run this updated script** so the
+  `tmux_session` field crosses the wire.
 - **Keyboard shortcut** — `claudetell.py focus <query>`, where `<query>` matches
   a session's letter, name, or folder substring (first live match wins):
 
