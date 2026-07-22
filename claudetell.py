@@ -34,6 +34,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -481,6 +482,32 @@ def _local_pane_by_name(name: str) -> str | None:
     return None
 
 
+def _remote_select_window(entry: dict) -> None:
+    """SSH to the host and switch its tmux to the window/pane hosting this
+    session. Raising the local ssh window alone lands on whatever window that
+    remote tmux session last showed — so sessions sharing one tmux session (each
+    in its own window) all resolve to the same kitty window and never switch.
+    This selects the right one by its remote pane id."""
+    pane = entry.get("pane")
+    remote = next(
+        (r for r in load_remotes()
+         if (r.get("name") or r.get("ssh")) == entry.get("host", "")), None)
+    target = remote and remote.get("ssh")
+    if not (pane and target):
+        return
+    opts = remote.get("ssh_opts") or ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+    sock = entry.get("tmux_sock")
+    tmux = "tmux" + (f" -S {shlex.quote(sock)}" if sock else "")
+    p = shlex.quote(pane)
+    rcmd = f"{tmux} select-window -t {p} && {tmux} select-pane -t {p}"
+    try:
+        subprocess.run(
+            ["ssh", *opts, target, rcmd], timeout=6, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def focus_session(entry: dict) -> None:
     """Focus the tmux pane + terminal GUI window hosting a session. Local
     sessions use their own pane/pid; a remote session (over SSH) is matched to
@@ -494,6 +521,7 @@ def focus_session(entry: dict) -> None:
         host = target.split("@")[-1] if target else None
         win = _find_ssh_kitty_window(host, entry.get("tmux_session"), entry.get("name"))
         if win:
+            _remote_select_window(entry)  # switch remote tmux to the exact window
             try:
                 subprocess.run(
                     ["kitten", "@", "--to", win["sock"], "focus-window",
