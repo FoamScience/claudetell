@@ -15,8 +15,9 @@ Usage:
   claudetell.py json [--all]          print live sessions as JSON (used over SSH)
   claudetell.py focus <query>         focus a session's window/pane (bind to a key)
   claudetell.py hook                  hook entrypoint (stdin JSON from Claude Code)
-  claudetell.py install               register hooks in ~/.claude/settings.json
-  claudetell.py uninstall             remove them
+  claudetell.py statusline            tee context usage, then run your statusline
+  claudetell.py install               register hooks + tee the statusline
+  claudetell.py uninstall             remove them, restore the statusline
 
 Lights:
   green   idle, waiting for next user prompt
@@ -55,6 +56,12 @@ WORKFLOW_TTL = 1800  # ponytail: no completion hook — badge/detail only, never
 SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
 REMOTES_CFG = STATE_DIR / "remotes.json"
 REMOTE_INTERVAL = 5  # seconds between SSH polls of each remote host
+CTX_DIR = STATE_DIR / "ctx"  # per-session context usage teed off the statusline
+# Fallback only, for sessions whose statusline hasn't rendered yet (or that run
+# without the tee installed): the transcript states tokens used but never the
+# window size, so guess the smallest tier that fits. A 1M session reads against
+# 200k until it grows past it — that's why the tee exists.
+CONTEXT_TIERS = (200_000, 1_000_000)
 
 
 # -- shared helpers ---------------------------------------------------------
@@ -737,6 +744,80 @@ def transcript_error(session_id: str) -> str | None:
     return err
 
 
+_ctx_cache: dict[str, tuple[float, int, int]] = {}  # sid -> (mtime, size, tokens)
+
+
+def context_used(session_id: str) -> int:
+    """Tokens in the session's context = the last main-chain assistant message's
+    prompt size (input + both cache buckets — they're disjoint slices of the same
+    prompt). Sidechain messages are a subagent's own window, not this one's."""
+    path = find_transcript(session_id)
+    if not path:
+        return 0
+    try:
+        stat = path.stat()
+        cached = _ctx_cache.get(session_id)
+        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+            return cached[2]
+        with open(path, "rb") as f:
+            # a wider tail than transcript_error's: one fat tool result can sit
+            # between the end of the file and the last assistant message
+            f.seek(max(0, stat.st_size - 262144))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0
+
+    used = 0
+    for line in reversed(tail.splitlines()):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        usage = (entry.get("message") or {}).get("usage") or {}
+        used = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+        )
+        if used:
+            break
+    _ctx_cache[session_id] = (stat.st_mtime, stat.st_size, used)
+    return used
+
+
+def context_limit(used: int) -> int:
+    """Smallest window tier that fits what the session used (see CONTEXT_TIERS)."""
+    return next((t for t in CONTEXT_TIERS if used <= t), CONTEXT_TIERS[-1])
+
+
+def session_context(session_id: str) -> tuple[int, int, float | None]:
+    """(used, limit, pct) for a session. The statusline tee is exact and wins;
+    without it we fall back to the transcript plus a guessed tier."""
+    rec = read_context(session_id) or {}
+    if rec.get("used") and rec.get("pct") is not None:
+        return rec["used"], rec.get("limit", 0), rec["pct"]
+    used = context_used(session_id)
+    # a record with only the window size still beats guessing the tier
+    limit = rec.get("limit") or 0
+    if limit:
+        return used, limit, 100.0 * used / limit
+    return used, context_limit(used), None
+
+
+def ctx_fraction(s: dict, override: int | None = None) -> float | None:
+    """How full a session's context window is, or None when unknown (no
+    transcript yet, or a session that hasn't had its first turn)."""
+    if not override and s.get("ctx_pct") is not None:
+        return min(1.0, s["ctx_pct"] / 100)
+    used = s.get("ctx") or 0
+    if not used:
+        return None
+    limit = override or s.get("ctx_limit") or context_limit(used)
+    return min(1.0, used / limit)
+
+
 def compute_light(
     base: str, st: dict, err: str | None, pid: int
 ) -> tuple[str, str, dict]:
@@ -831,6 +912,7 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             if not fresh and not tree_busy(pid):
                 status = "idle"
         light, detail, counts = compute_light(status, st, err, pid)
+        used, limit, pct = session_context(sid)
         pane, tmux_sock = session_tmux(pid)
         name = data.get("name") or Path(data.get("cwd", "?")).name
         entry = {
@@ -849,6 +931,9 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             "status": status or "unknown",
             "light": light,
             "detail": detail,
+            "ctx": used,
+            "ctx_limit": limit,
+            "ctx_pct": pct,
             "agents": counts["agents"],
             "workflows": counts["workflows"],
             "shells": counts["shells"],
@@ -1015,6 +1100,14 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
         ".ltr { color: rgba(0,0,0,0.72); font-weight: 700; font-size: 10px;"
         " text-shadow: 0 1px 1px rgba(255,255,255,0.25); }",
         ".name { color: #cdd6f4; font-size: 11px; }",
+        # context-usage bar: GTK3 progressbars style through their trough/progress
+        # sub-nodes, so min-height has to land on both or the bar keeps its default.
+        "progressbar.ctx trough { min-height: 4px; min-width: 26px;"
+        " background-color: rgba(255,255,255,0.14); border: none; border-radius: 999px; }",
+        "progressbar.ctx progress { min-height: 4px; border: none;"
+        " border-radius: 999px; background-color: #4ade80; }",
+        "progressbar.ctx.warn progress { background-color: #fbbf24; }",
+        "progressbar.ctx.full progress { background-color: #f87171; }",
         ".badge { background: rgba(30,30,46,0.95); color: #cdd6f4;"
         " font-size: 8px; font-weight: 700; padding: 0 2px; border-radius: 999px;"
         " border: 1px solid rgba(69,71,90,0.9); margin: 0 -2px -2px 0; }",
@@ -1210,6 +1303,21 @@ def cmd_overlay() -> None:
         else:
             ebox._badge.hide()
 
+    def set_ctx(ebox, s: dict) -> None:
+        frac = ctx_fraction(s, cfg.get("context_limit"))
+        if frac is None or not cfg.get("context", True):
+            ebox._ctx.hide()
+            return
+        ebox._ctx.set_fraction(frac)
+        style = ebox._ctx.get_style_context()
+        for name in ("warn", "full"):
+            style.remove_class(name)
+        if frac >= 0.9:
+            style.add_class("full")
+        elif frac >= 0.7:
+            style.add_class("warn")
+        ebox._ctx.show()
+
     def make_light(s: dict) -> Gtk.EventBox:
         dot = Gtk.Box()
         dot.set_size_request(LIGHT_PX, LIGHT_PX)
@@ -1236,9 +1344,15 @@ def cmd_overlay() -> None:
         name.set_ellipsize(Pango.EllipsizeMode.END)
         name.set_max_width_chars(20)
         name.set_no_show_all(True)  # visibility driven by cfg["labels"], not show_all
+        # context-usage bar: how full the session's window is. Sits after the
+        # name so it stays put whether or not labels are shown.
+        ctx = Gtk.ProgressBar(valign=Gtk.Align.CENTER)
+        ctx.get_style_context().add_class("ctx")
+        ctx.set_no_show_all(True)  # hidden until the session has a usage number
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
         row.pack_start(overlay, False, False, 0)
         row.pack_start(name, False, False, 0)
+        row.pack_start(ctx, False, False, 0)
         ebox = Gtk.EventBox(visible_window=False)
         ebox.add(row)
         ebox.set_has_tooltip(True)
@@ -1247,6 +1361,7 @@ def cmd_overlay() -> None:
         ebox._letter = letter
         ebox._name = name
         ebox._badge = badge
+        ebox._ctx = ctx
 
         def tooltip(_w, _x, _y, _kb, tip):
             sess = ebox._s
@@ -1259,6 +1374,14 @@ def cmd_overlay() -> None:
                 f"pid {sess['pid']} · up {_fmt_age(sess['startedAt'])}"
                 f" · changed {_fmt_age(sess['updatedAt'])} ago",
             ]
+            frac = ctx_fraction(sess, cfg.get("context_limit"))
+            if frac is not None:
+                limit = cfg.get("context_limit") or sess.get("ctx_limit", 0)
+                size = f" / {limit / 1000:.0f}k" if limit else ""
+                guess = "" if sess.get("ctx_pct") is not None else " (est.)"
+                lines.append(
+                    f"context {frac * 100:.0f}%{guess} · {sess['ctx'] / 1000:.0f}k{size}"
+                )
             if sess.get("detail"):
                 lines.append(esc(sess["detail"]))
             tip.set_markup("\n".join(lines))
@@ -1349,6 +1472,7 @@ def cmd_overlay() -> None:
             el._name.set_text(s.get("name", ""))
             el._name.set_visible(cfg.get("labels", True))
             set_badge(el, s)
+            set_ctx(el, s)
         for sid in list(lights):
             if sid not in seen:
                 lights.pop(sid).get_parent().destroy()
@@ -1429,6 +1553,18 @@ def cmd_overlay() -> None:
     labels_item.set_active(cfg.get("labels", True))
     labels_item.connect("toggled", toggle_labels)
     menu.append(labels_item)
+
+    def toggle_ctx(item) -> None:
+        cfg["context"] = item.get_active()
+        for el in lights.values():
+            set_ctx(el, el._s)
+        win.resize(1, 1)
+        save_cfg()
+
+    ctx_item = Gtk.CheckMenuItem(label="Show context usage")
+    ctx_item.set_active(cfg.get("context", True))
+    ctx_item.connect("toggled", toggle_ctx)
+    menu.append(ctx_item)
     menu.append(Gtk.SeparatorMenuItem())
     quit_item = Gtk.MenuItem(label="Quit claudetell")
     quit_item.connect("activate", Gtk.main_quit)
@@ -1474,9 +1610,103 @@ def cmd_overlay() -> None:
         save_cfg()
 
 
+# -- statusline tee ---------------------------------------------------------
+
+
+def wrapped_statusline() -> str:
+    """The statusline command claudetell displaced, kept verbatim in settings.json
+    (a string, not an argv list — it may use pipes, env prefixes or nested quotes,
+    so it goes back to a shell exactly as it was written)."""
+    try:
+        settings = json.loads((CLAUDE_DIR / "settings.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return (settings.get("statusLine") or {}).get("_claudetell_wrapped", "")
+
+
+def cmd_statusline() -> None:
+    """Read the statusline payload, record its context_window, then hand the same
+    bytes to whatever statusline was already configured and let it own the output.
+
+    The window *size* exists nowhere else: session files don't carry it, and the
+    transcript's model id never has the [1m] suffix that distinguishes a 1M model
+    from its 200k twin. Only the statusline payload states it, so claudetell tees
+    it rather than guessing. Every failure here is swallowed — a broken bar is a
+    cosmetic loss, a broken statusline is in your face on every render.
+    """
+    raw = sys.stdin.buffer.read()
+    try:
+        record_context(json.loads(raw.decode("utf-8", errors="replace")))
+    except (ValueError, json.JSONDecodeError, OSError):
+        pass
+    inner = wrapped_statusline()
+    if not inner:
+        return
+    try:
+        proc = subprocess.run(inner, shell=True, input=raw, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        return
+    sys.stdout.buffer.write(proc.stdout)
+    sys.stderr.buffer.write(proc.stderr)
+    sys.exit(proc.returncode)
+
+
+def record_context(payload: dict) -> None:
+    """Persist one session's context usage from a statusline payload."""
+    sid = payload.get("session_id") or payload.get("sessionId")
+    cw = payload.get("context_window") or {}
+    if not sid or not cw:
+        return
+    limit = cw.get("context_window_size") or 0
+    usage = cw.get("current_usage") or {}
+    used = (
+        usage.get("input_tokens", 0)
+        + usage.get("cache_read_input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0)
+    )
+    pct = cw.get("used_percentage")
+    # Claude Code's own percentage is authoritative when present — it knows what
+    # it reserves for the output budget; our tokens/limit ratio doesn't.
+    if pct is None and limit:
+        pct = 100.0 * used / limit
+    if pct is None and not limit:
+        return
+    if not used:
+        # some renders (a bulk redraw after /hooks reload) state the window size
+        # but no usage yet. The size is still the thing we can't get anywhere
+        # else, so keep it — but never let the zero overwrite a real reading.
+        prev = read_context(sid) or {}
+        used, pct = prev.get("used", 0), prev.get("pct")
+    CTX_DIR.mkdir(parents=True, exist_ok=True)
+    (CTX_DIR / f"{sid}.json").write_text(
+        json.dumps({"used": used, "limit": limit, "pct": pct, "ts": time.time()})
+    )
+    _prune_ctx()
+
+
+def _prune_ctx() -> None:
+    """Drop records for sessions that ended. Nothing signals the end, so age does:
+    a live session rewrites its record on every statusline render."""
+    cutoff = time.time() - 86400
+    for p in CTX_DIR.glob("*.json"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def read_context(session_id: str) -> dict | None:
+    try:
+        return json.loads((CTX_DIR / f"{session_id}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 # -- hook install/uninstall -------------------------------------------------
 
 HOOK_TAG = "claudetell.py hook"
+STATUSLINE_TAG = "claudetell.py statusline"
 
 
 def hook_entries() -> dict[str, list[dict]]:
@@ -1501,6 +1731,31 @@ def _is_ours(rule: dict) -> bool:
     return any(HOOK_TAG in h.get("command", "") for h in rule.get("hooks", []))
 
 
+def _wrap_statusline(settings: dict) -> str:
+    """Put claudetell in front of the configured statusline, passing its payload
+    through untouched. Idempotent, and a no-op when nothing is configured — we
+    only tee an existing statusline, never become one."""
+    sl = settings.get("statusLine")
+    if not isinstance(sl, dict) or sl.get("type") != "command":
+        return "no statusLine configured — context bars fall back to a guessed window size"
+    cmd = sl.get("command", "")
+    if STATUSLINE_TAG in cmd:
+        return "statusline already tee'd"
+    sl["_claudetell_wrapped"] = cmd  # verbatim: what we re-run, and what we restore
+    sl["command"] = f"python3 {shlex.quote(str(Path(__file__).resolve()))} statusline"
+    return "statusline tee'd (your statusline still renders it, untouched)"
+
+
+def _unwrap_statusline(settings: dict) -> None:
+    sl = settings.get("statusLine")
+    if isinstance(sl, dict) and STATUSLINE_TAG in sl.get("command", ""):
+        original = sl.pop("_claudetell_wrapped", None)
+        if original:
+            sl["command"] = original
+        else:
+            del settings["statusLine"]
+
+
 def cmd_install() -> None:
     settings_file = CLAUDE_DIR / "settings.json"
     settings = {}
@@ -1514,9 +1769,11 @@ def cmd_install() -> None:
         existing = hooks.setdefault(event, [])
         existing[:] = [r for r in existing if not _is_ours(r)]
         existing.extend(rules)
+    note = _wrap_statusline(settings)
     settings_file.write_text(json.dumps(settings, indent=2))
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"hooks installed in {settings_file} (backup: *.claudetell.bak)")
+    print(note)
     print("restart running claude sessions (or /hooks reload) to pick them up")
 
 
@@ -1530,8 +1787,9 @@ def cmd_uninstall() -> None:
         hooks[event] = [r for r in hooks[event] if not _is_ours(r)]
         if not hooks[event]:
             del hooks[event]
+    _unwrap_statusline(settings)
     settings_file.write_text(json.dumps(settings, indent=2))
-    print("claudetell hooks removed")
+    print("claudetell hooks removed, statusline restored")
 
 
 # -- frontend ---------------------------------------------------------------
@@ -1668,6 +1926,7 @@ function showTip(el, s) {
     <div class="cwd">${esc(s.cwd)}</div>
     <div class="row"><span>state</span><span>${esc(s.light)} · ${esc(s.status)}</span></div>
     <div class="row"><span>pid</span><span>${s.pid}</span></div>
+    ${s.ctx ? `<div class="row"><span>context</span><span>${Math.round(s.ctx_pct ?? 100 * s.ctx / s.ctx_limit)}%${s.ctx_pct == null ? " (est.)" : ""} · ${Math.round(s.ctx / 1000)}k${s.ctx_limit ? ` / ${Math.round(s.ctx_limit / 1000)}k` : ""}</span></div>` : ""}
     <div class="row"><span>up</span><span>${fmtAge(Date.now() - s.startedAt)}</span></div>
     <div class="row"><span>changed</span><span>${fmtAge(Date.now() - s.updatedAt)} ago</span></div>
     ${s.detail ? `<div class="detail">${esc(s.detail)}</div>` : ""}`;
@@ -1779,6 +2038,8 @@ def main() -> None:
     cmd = args[0] if args else "overlay"
     if cmd == "hook":
         cmd_hook()
+    elif cmd == "statusline":
+        cmd_statusline()
     elif cmd == "focus":
         cmd_focus(args[1] if len(args) > 1 else "")
     elif cmd == "overlay":

@@ -15,6 +15,10 @@ that session's terminal ([Focus](#focus-a-session)).
   identically in the overlay and browser; wraps only past twelve folders.
 - **Letter** — the session's initial, centred in the light; the compact identity
   when names are hidden and in the browser view. Full name is always on hover.
+- **Context bar** — a thin bar beside each light showing how full that session's
+  context window is (green → amber at 70% → red at 90%); exact numbers on hover.
+  Right-click → *Show context usage* to toggle. See
+  [Context usage](#context-usage) for where the number comes from.
 
 | light | meaning |
 |---|---|
@@ -55,6 +59,37 @@ http://127.0.0.1:7717, with a ⧉ button for a Chrome picture-in-picture
 always-on-top window. `--host` and `--port` override the bind address
 (default loopback; it has no auth, so keep it on 127.0.0.1 and reach it over an
 SSH tunnel — `ssh -L 7717:127.0.0.1:7717` — rather than binding 0.0.0.0).
+
+## Context usage
+
+Claude Code tells you how full a session's context window is in exactly one
+place: the JSON it pipes to your **statusline**. The transcript records tokens
+used per message but never the window size, and the model id there is always
+plain (`claude-opus-4-8`) — never the `[1m]` variant that distinguishes a 1M
+model from its 200k twin. Guessing therefore gets it badly wrong: 147k tokens is
+74% of a 200k window but 15% of a 1M one.
+
+So `install` puts claudetell *in front of* your statusline. It reads the
+payload, records `context_window` to `~/.local/state/claudetell/ctx/<id>.json`,
+then runs your original statusline command with the same stdin and prints its
+output verbatim. Your statusline is unchanged — claudetell just reads the mail.
+The displaced command is stored next to it in `settings.json` as
+`_claudetell_wrapped`, and `uninstall` puts it back.
+
+```jsonc
+"statusLine": {
+  "type": "command",
+  "command": "python3 /path/to/claudetell.py statusline",
+  "_claudetell_wrapped": "<your original command, verbatim>"
+}
+```
+
+Every failure in the tee is swallowed and the wrapped command still runs — a
+missing bar is cosmetic, a broken statusline is not. If you have no statusline
+configured, claudetell does **not** install itself as one; it falls back to the
+transcript's token count against a guessed window tier (200k, then 1M), and the
+hover text marks those as `(est.)`. Same fallback for a session that hasn't
+rendered its statusline yet, and for remote hosts without the tee installed.
 
 ## Focus a session
 
