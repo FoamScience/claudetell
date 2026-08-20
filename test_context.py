@@ -3,6 +3,7 @@ records per-message usage but never the window size)."""
 
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import claudetell
@@ -155,3 +156,26 @@ if __name__ == "__main__":
     test_statusline_tee()
     test_statusline_wrap_roundtrip()
     print("ok")
+
+
+def test_record_limits_ignores_stale_payload(tmp_path, monkeypatch):
+    monkeypatch.setattr(claudetell, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(claudetell, "LIMITS_FILE", tmp_path / "limits.json")
+    fresh = {
+        "rate_limits": {
+            "five_hour": {"used_percentage": 19, "resets_at": time.time() + 3600},
+            "seven_day": {"used_percentage": 28, "resets_at": time.time() + 86400},
+        }
+    }
+    claudetell.record_limits(fresh)
+    assert claudetell.read_limits()["five_hour"]["pct"] == 19
+    # an idle session still reporting a window that already reset must not win
+    claudetell.record_limits(
+        {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 46, "resets_at": time.time() - 60},
+                "seven_day": {"used_percentage": 11, "resets_at": time.time() + 86400},
+            }
+        }
+    )
+    assert claudetell.read_limits()["five_hour"]["pct"] == 19

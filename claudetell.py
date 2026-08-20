@@ -57,6 +57,8 @@ SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
 REMOTES_CFG = STATE_DIR / "remotes.json"
 REMOTE_INTERVAL = 5  # seconds between SSH polls of each remote host
 CTX_DIR = STATE_DIR / "ctx"  # per-session context usage teed off the statusline
+LIMITS_FILE = STATE_DIR / "limits.json"  # account-wide rate limits, same tee
+LIMITS_STALE = 3600  # no statusline render this long → the numbers are guesswork
 # Fallback only, for sessions whose statusline hasn't rendered yet (or that run
 # without the tee installed): the transcript states tokens used but never the
 # window size, so guess the smallest tier that fits. A 1M session reads against
@@ -1100,6 +1102,7 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
         ".ltr { color: rgba(0,0,0,0.72); font-weight: 700; font-size: 10px;"
         " text-shadow: 0 1px 1px rgba(255,255,255,0.25); }",
         ".name { color: #cdd6f4; font-size: 11px; }",
+        ".ulbl { color: #a6adc8; font-size: 9px; font-weight: 700; }",
         # context-usage bar: GTK3 progressbars style through their trough/progress
         # sub-nodes, so min-height has to land on both or the bar keeps its default.
         "progressbar.ctx trough { min-height: 4px; min-width: 26px;"
@@ -1202,9 +1205,63 @@ def cmd_overlay() -> None:
         lambda a, b: getattr(a.get_child(), "_order", 0)
         - getattr(b.get_child(), "_order", 0)
     )
-    box = Gtk.Box(margin=10)
-    box.add(flow)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+    # account-wide rate-limit bars, above the lights. Same look as the per-session
+    # context bars; the numbers come from the statusline tee (see record_limits).
+    usage_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+    usage_box.set_no_show_all(True)  # visibility is driven by data + cfg["usage"]
+    usage_rows: dict[str, tuple] = {}
+    for _key, _label in (("five_hour", "5h"), ("seven_day", "7d")):
+        _lbl = Gtk.Label(label=_label, xalign=0)
+        _lbl.get_style_context().add_class("ulbl")
+        _bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER)
+        _bar.get_style_context().add_class("ctx")
+        _row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        _row.pack_start(_lbl, False, False, 0)
+        _row.pack_start(_bar, True, True, 0)
+        _row.set_has_tooltip(True)
+        usage_box.pack_start(_row, False, False, 0)
+        usage_rows[_key] = (_row, _bar)
+    box.pack_start(usage_box, False, False, 0)
+    box.pack_start(flow, True, True, 0)
     win.add(box)
+
+    def usage_tooltip(row, _x, _y, _kb, tip, key=None, label=None):
+        w = (read_limits() or {}).get(key) or {}
+        pct = w.get("pct")
+        if pct is None:
+            return False
+        text = f"{label} limit {pct:.0f}% used"
+        resets = w.get("resets_at")
+        if resets:
+            left = max(0, resets - time.time())
+            text += f" · resets in {left // 3600:.0f}h {left % 3600 // 60:.0f}m"
+        tip.set_text(text)
+        return True
+
+    for _key, _label in (("five_hour", "5 hour"), ("seven_day", "7 day")):
+        usage_rows[_key][0].connect("query-tooltip", usage_tooltip, _key, _label)
+
+    def set_usage() -> None:
+        limits = read_limits() if cfg.get("usage", True) else {}
+        shown = False
+        for key, (row, bar) in usage_rows.items():
+            pct = (limits.get(key) or {}).get("pct")
+            if pct is None:
+                row.hide()
+                continue
+            frac = min(1.0, max(0.0, pct / 100.0))
+            bar.set_fraction(frac)
+            style = bar.get_style_context()
+            for name in ("warn", "full"):
+                style.remove_class(name)
+            if frac >= 0.9:
+                style.add_class("full")
+            elif frac >= 0.7:
+                style.add_class("warn")
+            row.show_all()
+            shown = True
+        usage_box.set_visible(shown)
 
     lights: dict[str, Gtk.Widget] = {}
     seps: list[Gtk.Widget] = []
@@ -1478,6 +1535,7 @@ def cmd_overlay() -> None:
                 lights.pop(sid).get_parent().destroy()
                 changed = True
         set_empty()
+        set_usage()
         if changed:
             regroup(sessions)
             apply_layout(cfg.get("layout", "v"))
@@ -1565,6 +1623,17 @@ def cmd_overlay() -> None:
     ctx_item.set_active(cfg.get("context", True))
     ctx_item.connect("toggled", toggle_ctx)
     menu.append(ctx_item)
+
+    def toggle_usage(item) -> None:
+        cfg["usage"] = item.get_active()
+        set_usage()
+        win.resize(1, 1)
+        save_cfg()
+
+    usage_item = Gtk.CheckMenuItem(label="Show usage limits")
+    usage_item.set_active(cfg.get("usage", True))
+    usage_item.connect("toggled", toggle_usage)
+    menu.append(usage_item)
     menu.append(Gtk.SeparatorMenuItem())
     quit_item = Gtk.MenuItem(label="Quit claudetell")
     quit_item.connect("activate", Gtk.main_quit)
@@ -1636,7 +1705,9 @@ def cmd_statusline() -> None:
     """
     raw = sys.stdin.buffer.read()
     try:
-        record_context(json.loads(raw.decode("utf-8", errors="replace")))
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+        record_context(payload)
+        record_limits(payload)
     except (ValueError, json.JSONDecodeError, OSError):
         pass
     inner = wrapped_statusline()
@@ -1701,6 +1772,39 @@ def read_context(session_id: str) -> dict | None:
         return json.loads((CTX_DIR / f"{session_id}.json").read_text())
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def record_limits(payload: dict) -> None:
+    """Persist the account's rate-limit windows from a statusline payload. They
+    belong to the account, not the session, so the newest render wins."""
+    rl = payload.get("rate_limits") or {}
+    now = time.time()
+    rec = {"ts": now}
+    for key in ("five_hour", "seven_day"):
+        w = rl.get(key) or {}
+        pct = w.get("used_percentage")
+        if pct is None:
+            continue
+        resets = w.get("resets_at")
+        # Claude Code carries the limits from the last API response, so an idle
+        # session keeps rendering a window that has since reset. A reset time in
+        # the past dates the whole payload — drop it, or the bars flap between
+        # a live session's numbers and a stale one's.
+        if resets and resets <= now:
+            return
+        rec[key] = {"pct": pct, "resets_at": resets}
+    if len(rec) == 1:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LIMITS_FILE.write_text(json.dumps(rec))
+
+
+def read_limits() -> dict:
+    try:
+        rec = json.loads(LIMITS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {} if time.time() - rec.get("ts", 0) > LIMITS_STALE else rec
 
 
 # -- hook install/uninstall -------------------------------------------------
