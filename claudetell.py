@@ -1776,9 +1776,14 @@ def read_context(session_id: str) -> dict | None:
 
 def record_limits(payload: dict) -> None:
     """Persist the account's rate-limit windows from a statusline payload. They
-    belong to the account, not the session, so the newest render wins."""
+    belong to the account, so any session's render can update them — but only
+    upwards: Claude Code reports the limits its *last API response* carried, so
+    an idle session keeps re-rendering an old snapshot of the same window. Usage
+    only climbs until a window resets, which makes the highest reading in a
+    window the newest one, and keeps the bars from flapping between sessions."""
     rl = payload.get("rate_limits") or {}
     now = time.time()
+    prev = _load_limits()
     rec = {"ts": now}
     for key in ("five_hour", "seven_day"):
         w = rl.get(key) or {}
@@ -1786,24 +1791,33 @@ def record_limits(payload: dict) -> None:
         if pct is None:
             continue
         resets = w.get("resets_at")
-        # Claude Code carries the limits from the last API response, so an idle
-        # session keeps rendering a window that has since reset. A reset time in
-        # the past dates the whole payload — drop it, or the bars flap between
-        # a live session's numbers and a stale one's.
         if resets and resets <= now:
-            return
-        rec[key] = {"pct": pct, "resets_at": resets}
+            continue  # window already reset — this payload predates it
+        old = prev.get(key) or {}
+        if old.get("resets_at") == resets and (old.get("pct") or 0) > pct:
+            rec[key] = old  # same window, lower number → older snapshot
+        else:
+            rec[key] = {"pct": pct, "resets_at": resets}
+    for key in ("five_hour", "seven_day"):
+        # a payload missing one window must not drop what another session knows
+        old = prev.get(key) or {}
+        if key not in rec and old and (old.get("resets_at") or now + 1) > now:
+            rec[key] = old
     if len(rec) == 1:
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     LIMITS_FILE.write_text(json.dumps(rec))
 
 
-def read_limits() -> dict:
+def _load_limits() -> dict:
     try:
-        rec = json.loads(LIMITS_FILE.read_text())
+        return json.loads(LIMITS_FILE.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def read_limits() -> dict:
+    rec = _load_limits()
     return {} if time.time() - rec.get("ts", 0) > LIMITS_STALE else rec
 
 

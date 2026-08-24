@@ -179,3 +179,30 @@ def test_record_limits_ignores_stale_payload(tmp_path, monkeypatch):
         }
     )
     assert claudetell.read_limits()["five_hour"]["pct"] == 19
+
+
+def test_record_limits_keeps_the_newest_reading_in_a_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(claudetell, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(claudetell, "LIMITS_FILE", tmp_path / "limits.json")
+    five, seven = time.time() + 3600, time.time() + 86400
+
+    def render(fh, fd, five_at=None):
+        claudetell.record_limits(
+            {
+                "rate_limits": {
+                    "five_hour": {"used_percentage": fh, "resets_at": five_at or five},
+                    "seven_day": {"used_percentage": fd, "resets_at": seven},
+                }
+            }
+        )
+
+    # an idle session re-renders its old snapshot of the same window: usage only
+    # climbs, so the peak is the newest reading and the bars must not flap
+    for pct, weekly in ((78, 16), (0, 6), (79, 16), (78, 16)):
+        render(pct, weekly)
+    limits = claudetell.read_limits()
+    assert limits["five_hour"]["pct"] == 79
+    assert limits["seven_day"]["pct"] == 16
+    # ...but a fresh window starts over
+    render(3, 17, five_at=five + 3600)
+    assert claudetell.read_limits()["five_hour"]["pct"] == 3
