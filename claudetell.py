@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -59,6 +60,10 @@ REMOTE_INTERVAL = 5  # seconds between SSH polls of each remote host
 CTX_DIR = STATE_DIR / "ctx"  # per-session context usage teed off the statusline
 LIMITS_FILE = STATE_DIR / "limits.json"  # account-wide rate limits, same tee
 LIMITS_STALE = 3600  # no statusline render this long → the numbers are guesswork
+CSWAP_DIR = (
+    Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+    / "claude-swap"
+)
 # Fallback only, for sessions whose statusline hasn't rendered yet (or that run
 # without the tee installed): the transcript states tokens used but never the
 # window size, so guess the smallest tier that fits. A 1M session reads against
@@ -1111,6 +1116,8 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
         " border-radius: 999px; background-color: #4ade80; }",
         "progressbar.ctx.warn progress { background-color: #fbbf24; }",
         "progressbar.ctx.full progress { background-color: #f87171; }",
+        # an account cswap isn't currently on: same colours, quieter
+        "progressbar.ctx.idle progress { opacity: 0.45; }",
         ".badge { background: rgba(30,30,46,0.95); color: #cdd6f4;"
         " font-size: 8px; font-weight: 700; padding: 0 2px; border-radius: 999px;"
         " border: 1px solid rgba(69,71,90,0.9); margin: 0 -2px -2px 0; }",
@@ -1206,62 +1213,95 @@ def cmd_overlay() -> None:
         - getattr(b.get_child(), "_order", 0)
     )
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
-    # account-wide rate-limit bars, above the lights. Same look as the per-session
-    # context bars; the numbers come from the statusline tee (see record_limits).
+    # rate-limit bars, above the lights: one row per account per window (cswap
+    # knows every account, not only the one you're on — see read_limits). Same
+    # look as the per-session context bars.
     usage_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
     usage_box.set_no_show_all(True)  # visibility is driven by data + cfg["usage"]
-    usage_rows: dict[str, tuple] = {}
-    for _key, _label in (("five_hour", "5h"), ("seven_day", "7d")):
-        _lbl = Gtk.Label(label=_label, xalign=0)
-        _lbl.get_style_context().add_class("ulbl")
-        _bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER)
-        _bar.get_style_context().add_class("ctx")
-        _row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        _row.pack_start(_lbl, False, False, 0)
-        _row.pack_start(_bar, True, True, 0)
-        _row.set_has_tooltip(True)
-        usage_box.pack_start(_row, False, False, 0)
-        usage_rows[_key] = (_row, _bar)
+    usage_rows: dict[str, Gtk.Box] = {}
     box.pack_start(usage_box, False, False, 0)
     box.pack_start(flow, True, True, 0)
     win.add(box)
 
-    def usage_tooltip(row, _x, _y, _kb, tip, key=None, label=None):
-        w = (read_limits() or {}).get(key) or {}
-        pct = w.get("pct")
-        if pct is None:
-            return False
-        text = f"{label} limit {pct:.0f}% used"
-        resets = w.get("resets_at")
-        if resets:
-            left = max(0, resets - time.time())
-            text += f" · resets in {left // 3600:.0f}h {left % 3600 // 60:.0f}m"
-        tip.set_text(text)
+    WINDOWS = (("five_hour", "5h", "5 hour"), ("seven_day", "7d", "7 day"))
+
+    def usage_tooltip(row, _x, _y, _kb, tip):
+        acct = row._acct
+        who = acct["email"] or "this account"
+        head = f"<b>{GLib.markup_escape_text(who)}</b>"
+        if not acct["active"] and acct["email"]:
+            head += " <i>(not active)</i>"
+        lines = [head]
+        for window, _short, long in WINDOWS:
+            w = acct.get(window)
+            if not w:
+                continue
+            line = f"{long} limit {w['pct']:.0f}% used"
+            if w.get("resets_at"):
+                left = max(0, w["resets_at"] - time.time())
+                line += f" · resets in {left // 3600:.0f}h {left % 3600 // 60:.0f}m"
+            lines.append(line)
+        tip.set_markup("\n".join(lines))
         return True
 
-    for _key, _label in (("five_hour", "5 hour"), ("seven_day", "7 day")):
-        usage_rows[_key][0].connect("query-tooltip", usage_tooltip, _key, _label)
+    def usage_row(key: str) -> Gtk.Box:
+        """One account: its number, then a labelled bar per window."""
+        row = usage_rows.get(key)
+        if row is None:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            num = Gtk.Label(xalign=0)
+            num.get_style_context().add_class("ulbl")
+            num.set_no_show_all(True)  # nothing to disambiguate on one account
+            row.pack_start(num, False, False, 0)
+            row._num, row._bars = num, {}
+            for window, short, _long in WINDOWS:
+                lbl = Gtk.Label(label=short, xalign=0)
+                lbl.get_style_context().add_class("ulbl")
+                bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER)
+                bar.get_style_context().add_class("ctx")
+                cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+                cell.pack_start(lbl, False, False, 0)
+                cell.pack_start(bar, True, True, 0)
+                row.pack_start(cell, True, True, 0)
+                row._bars[window] = (cell, bar)
+            row.set_has_tooltip(True)
+            row.connect("query-tooltip", usage_tooltip)
+            usage_box.pack_start(row, False, False, 0)
+            row.show_all()  # per-widget visibility is set below, not by show_all
+            usage_rows[key] = row
+        return row
 
     def set_usage() -> None:
-        limits = read_limits() if cfg.get("usage", True) else {}
-        shown = False
-        for key, (row, bar) in usage_rows.items():
-            pct = (limits.get(key) or {}).get("pct")
-            if pct is None:
-                row.hide()
-                continue
-            frac = min(1.0, max(0.0, pct / 100.0))
-            bar.set_fraction(frac)
-            style = bar.get_style_context()
-            for name in ("warn", "full"):
-                style.remove_class(name)
-            if frac >= 0.9:
-                style.add_class("full")
-            elif frac >= 0.7:
-                style.add_class("warn")
-            row.show_all()
-            shown = True
-        usage_box.set_visible(shown)
+        accounts = read_limits() if cfg.get("usage", True) else []
+        seen = set()
+        for pos, acct in enumerate(accounts):
+            seen.add(acct["id"])
+            row = usage_row(acct["id"])
+            row._acct = acct
+            row._num.set_text(f"#{acct['label']}")
+            row._num.set_visible(len(accounts) > 1 and bool(acct["label"]))
+            for window, (cell, bar) in row._bars.items():
+                w = acct.get(window)
+                cell.set_visible(bool(w))
+                if not w:
+                    continue
+                frac = min(1.0, max(0.0, w["pct"] / 100.0))
+                bar.set_fraction(frac)
+                style = bar.get_style_context()
+                for name in ("warn", "full", "idle"):
+                    style.remove_class(name)
+                if frac >= 0.9:
+                    style.add_class("full")
+                elif frac >= 0.7:
+                    style.add_class("warn")
+                if not acct["active"]:
+                    style.add_class("idle")  # dimmed: an account you're not on
+            usage_box.reorder_child(row, pos)
+            row.show()
+        for key in list(usage_rows):
+            if key not in seen:
+                usage_rows.pop(key).destroy()
+        usage_box.set_visible(bool(seen))
 
     lights: dict[str, Gtk.Widget] = {}
     seps: list[Gtk.Widget] = []
@@ -1816,9 +1856,57 @@ def _load_limits() -> dict:
         return {}
 
 
-def read_limits() -> dict:
+def _cswap_accounts() -> list[dict]:
+    """Every account claude-swap knows, newest measurement each. When cswap is
+    driving the accounts it beats the statusline tee outright: it polls each
+    account's usage directly, so a swap moves the bars at once, no session can
+    report the window of an account that is no longer active, and the accounts
+    you are *not* on are worth seeing — that's where the headroom is."""
+    try:
+        table = json.loads((CSWAP_DIR / "cache/usage.json").read_text())["accounts"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return []
+    try:
+        active = str(
+            json.loads((CSWAP_DIR / "sequence.json").read_text())["activeAccountNumber"]
+        )
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        active = None
+    out = []
+    for num, acct in sorted(table.items()):
+        rec = {
+            "id": num,
+            "label": num,
+            "email": acct.get("email", ""),
+            "active": num == active,
+            "ts": acct.get("fetchedAt", 0),
+        }
+        good = acct.get("lastGood") or {}
+        for key in ("five_hour", "seven_day"):
+            w = good.get(key) or {}
+            if w.get("pct") is None:
+                continue
+            try:
+                resets = datetime.fromisoformat(w["resets_at"]).timestamp()
+            except (KeyError, TypeError, ValueError):
+                resets = None
+            rec[key] = {"pct": w["pct"], "resets_at": resets}
+        if "five_hour" in rec or "seven_day" in rec:
+            out.append(rec)
+    return out
+
+
+def read_limits() -> list[dict]:
+    """Rate-limit windows to draw, one entry per account. cswap's own table when
+    it's there, else the single account the statusline tee saw."""
+    fresh = [a for a in _cswap_accounts() if time.time() - a["ts"] <= LIMITS_STALE]
+    if fresh:
+        return fresh
     rec = _load_limits()
-    return {} if time.time() - rec.get("ts", 0) > LIMITS_STALE else rec
+    if not rec or time.time() - rec.get("ts", 0) > LIMITS_STALE:
+        return []
+    rec.update({"id": "", "label": "", "email": "", "active": True})
+    return [rec]
 
 
 # -- hook install/uninstall -------------------------------------------------

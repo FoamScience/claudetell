@@ -161,6 +161,7 @@ if __name__ == "__main__":
 def test_record_limits_ignores_stale_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(claudetell, "STATE_DIR", tmp_path)
     monkeypatch.setattr(claudetell, "LIMITS_FILE", tmp_path / "limits.json")
+    monkeypatch.setattr(claudetell, "CSWAP_DIR", tmp_path / "no-cswap")
     fresh = {
         "rate_limits": {
             "five_hour": {"used_percentage": 19, "resets_at": time.time() + 3600},
@@ -168,7 +169,7 @@ def test_record_limits_ignores_stale_payload(tmp_path, monkeypatch):
         }
     }
     claudetell.record_limits(fresh)
-    assert claudetell.read_limits()["five_hour"]["pct"] == 19
+    assert claudetell.read_limits()[0]["five_hour"]["pct"] == 19
     # an idle session still reporting a window that already reset must not win
     claudetell.record_limits(
         {
@@ -178,12 +179,13 @@ def test_record_limits_ignores_stale_payload(tmp_path, monkeypatch):
             }
         }
     )
-    assert claudetell.read_limits()["five_hour"]["pct"] == 19
+    assert claudetell.read_limits()[0]["five_hour"]["pct"] == 19
 
 
 def test_record_limits_keeps_the_newest_reading_in_a_window(tmp_path, monkeypatch):
     monkeypatch.setattr(claudetell, "STATE_DIR", tmp_path)
     monkeypatch.setattr(claudetell, "LIMITS_FILE", tmp_path / "limits.json")
+    monkeypatch.setattr(claudetell, "CSWAP_DIR", tmp_path / "no-cswap")
     five, seven = time.time() + 3600, time.time() + 86400
 
     def render(fh, fd, five_at=None):
@@ -200,9 +202,61 @@ def test_record_limits_keeps_the_newest_reading_in_a_window(tmp_path, monkeypatc
     # climbs, so the peak is the newest reading and the bars must not flap
     for pct, weekly in ((78, 16), (0, 6), (79, 16), (78, 16)):
         render(pct, weekly)
-    limits = claudetell.read_limits()
+    limits = claudetell.read_limits()[0]
     assert limits["five_hour"]["pct"] == 79
     assert limits["seven_day"]["pct"] == 16
     # ...but a fresh window starts over
     render(3, 17, five_at=five + 3600)
-    assert claudetell.read_limits()["five_hour"]["pct"] == 3
+    assert claudetell.read_limits()[0]["five_hour"]["pct"] == 3
+
+
+def test_read_limits_reports_every_cswap_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(claudetell, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(claudetell, "LIMITS_FILE", tmp_path / "limits.json")
+    monkeypatch.setattr(claudetell, "CSWAP_DIR", tmp_path / "cswap")
+    claudetell.record_limits(
+        {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 78, "resets_at": time.time() + 3600},
+                "seven_day": {"used_percentage": 16, "resets_at": time.time() + 86400},
+            }
+        }
+    )
+    cache = tmp_path / "cswap" / "cache"
+    cache.mkdir(parents=True)
+    (tmp_path / "cswap" / "sequence.json").write_text('{"activeAccountNumber": 2}')
+    (cache / "usage.json").write_text(
+        json.dumps(
+            {
+                "accounts": {
+                    "1": {
+                        "fetchedAt": time.time(),
+                        "lastGood": {
+                            "five_hour": {
+                                "pct": 100.0,
+                                "resets_at": "2099-01-01T00:00:00+00:00",
+                            }
+                        },
+                    },
+                    "2": {
+                        "fetchedAt": time.time(),
+                        "lastGood": {
+                            "five_hour": {
+                                "pct": 5.0,
+                                "resets_at": "2099-01-01T00:00:00+00:00",
+                            },
+                            "seven_day": {
+                                "pct": 9.0,
+                                "resets_at": "2099-01-02T00:00:00+00:00",
+                            },
+                        },
+                    },
+                }
+            }
+        )
+    )
+    # cswap's table wins over whatever a session teed, and shows every account
+    accounts = claudetell.read_limits()
+    assert [a["id"] for a in accounts] == ["1", "2"]
+    assert [a["active"] for a in accounts] == [False, True]
+    assert accounts[1]["five_hour"]["pct"] == 5.0
