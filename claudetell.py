@@ -15,9 +15,8 @@ Usage:
   claudetell.py json [--all]          print live sessions as JSON (used over SSH)
   claudetell.py focus <query>         focus a session's window/pane (bind to a key)
   claudetell.py hook                  hook entrypoint (stdin JSON from Claude Code)
-  claudetell.py statusline            tee context usage, then run your statusline
-  claudetell.py install               register hooks + tee the statusline
-  claudetell.py uninstall             remove them, restore the statusline
+  claudetell.py install               register hooks
+  claudetell.py uninstall             remove them
 
 Lights:
   green   idle, waiting for next user prompt
@@ -32,6 +31,7 @@ from __future__ import annotations
 
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -57,17 +57,16 @@ WORKFLOW_TTL = 1800  # ponytail: no completion hook — badge/detail only, never
 SHELL_COMMS = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
 REMOTES_CFG = STATE_DIR / "remotes.json"
 REMOTE_INTERVAL = 5  # seconds between SSH polls of each remote host
-CTX_DIR = STATE_DIR / "ctx"  # per-session context usage teed off the statusline
-LIMITS_FILE = STATE_DIR / "limits.json"  # account-wide rate limits, same tee
-LIMITS_STALE = 3600  # no statusline render this long → the numbers are guesswork
+HUD_CTX_DIR = CLAUDE_DIR / "plugins" / "claude-hud" / "context-cache"
+LIMITS_STALE = 3600  # no cswap measurement this long → the numbers are guesswork
 CSWAP_DIR = (
     Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
     / "claude-swap"
 )
-# Fallback only, for sessions whose statusline hasn't rendered yet (or that run
-# without the tee installed): the transcript states tokens used but never the
-# window size, so guess the smallest tier that fits. A 1M session reads against
-# 200k until it grows past it — that's why the tee exists.
+# Fallback only, for sessions claude-hud hasn't cached yet (or hosts running
+# without it): the transcript states tokens used but never the window size, so
+# guess the smallest tier that fits. A 1M session reads against 200k until it
+# grows past it — that's what hud's cache spares us.
 CONTEXT_TIERS = (200_000, 1_000_000)
 
 
@@ -800,8 +799,8 @@ def context_limit(used: int) -> int:
 
 
 def session_context(session_id: str) -> tuple[int, int, float | None]:
-    """(used, limit, pct) for a session. The statusline tee is exact and wins;
-    without it we fall back to the transcript plus a guessed tier."""
+    """(used, limit, pct) for a session. claude-hud's cached reading is exact and
+    wins; without it we fall back to the transcript plus a guessed tier."""
     rec = read_context(session_id) or {}
     if rec.get("used") and rec.get("pct") is not None:
         return rec["used"], rec.get("limit", 0), rec["pct"]
@@ -1719,146 +1718,46 @@ def cmd_overlay() -> None:
         save_cfg()
 
 
-# -- statusline tee ---------------------------------------------------------
+# -- context usage ----------------------------------------------------------
 
 
-def wrapped_statusline() -> str:
-    """The statusline command claudetell displaced, kept verbatim in settings.json
-    (a string, not an argv list — it may use pipes, env prefixes or nested quotes,
-    so it goes back to a shell exactly as it was written)."""
+def read_context(session_id: str) -> dict | None:
+    """This session's context window, as claude-hud cached it.
+
+    Claude Code states the window *size* in one place only: the JSON it pipes to
+    the statusline. Session files don't carry it, and the transcript's model id
+    never has the [1m] suffix that tells a 1M model from its 200k twin. claude-hud
+    owns the statusline and writes each session's reading to disk, keyed by a
+    sha256 of the transcript path — so we read its cache instead of sitting in
+    front of it. A tee is not an option: Claude Code rewrites settings.json and
+    drops the key the displaced command was kept in, leaving a statusline that
+    renders nothing."""
+    path = find_transcript(session_id)
+    if not path:
+        return None
+    key = hashlib.sha256(os.path.abspath(path).encode()).hexdigest()
     try:
-        settings = json.loads((CLAUDE_DIR / "settings.json").read_text())
+        rec = json.loads((HUD_CTX_DIR / f"{key}.json").read_text())
     except (OSError, json.JSONDecodeError):
-        return ""
-    return (settings.get("statusLine") or {}).get("_claudetell_wrapped", "")
-
-
-def cmd_statusline() -> None:
-    """Read the statusline payload, record its context_window, then hand the same
-    bytes to whatever statusline was already configured and let it own the output.
-
-    The window *size* exists nowhere else: session files don't carry it, and the
-    transcript's model id never has the [1m] suffix that distinguishes a 1M model
-    from its 200k twin. Only the statusline payload states it, so claudetell tees
-    it rather than guessing. Every failure here is swallowed — a broken bar is a
-    cosmetic loss, a broken statusline is in your face on every render.
-    """
-    raw = sys.stdin.buffer.read()
-    try:
-        payload = json.loads(raw.decode("utf-8", errors="replace"))
-        record_context(payload)
-        record_limits(payload)
-    except (ValueError, json.JSONDecodeError, OSError):
-        pass
-    inner = wrapped_statusline()
-    if not inner:
-        return
-    try:
-        proc = subprocess.run(inner, shell=True, input=raw, capture_output=True)
-    except (OSError, subprocess.SubprocessError):
-        return
-    sys.stdout.buffer.write(proc.stdout)
-    sys.stderr.buffer.write(proc.stderr)
-    sys.exit(proc.returncode)
-
-
-def record_context(payload: dict) -> None:
-    """Persist one session's context usage from a statusline payload."""
-    sid = payload.get("session_id") or payload.get("sessionId")
-    cw = payload.get("context_window") or {}
-    if not sid or not cw:
-        return
-    limit = cw.get("context_window_size") or 0
-    usage = cw.get("current_usage") or {}
+        return None
+    usage = rec.get("current_usage") or {}
     used = (
         usage.get("input_tokens", 0)
         + usage.get("cache_read_input_tokens", 0)
         + usage.get("cache_creation_input_tokens", 0)
     )
-    pct = cw.get("used_percentage")
-    # Claude Code's own percentage is authoritative when present — it knows what
-    # it reserves for the output budget; our tokens/limit ratio doesn't.
-    if pct is None and limit:
-        pct = 100.0 * used / limit
-    if pct is None and not limit:
-        return
-    if not used:
-        # some renders (a bulk redraw after /hooks reload) state the window size
-        # but no usage yet. The size is still the thing we can't get anywhere
-        # else, so keep it — but never let the zero overwrite a real reading.
-        prev = read_context(sid) or {}
-        used, pct = prev.get("used", 0), prev.get("pct")
-    CTX_DIR.mkdir(parents=True, exist_ok=True)
-    (CTX_DIR / f"{sid}.json").write_text(
-        json.dumps({"used": used, "limit": limit, "pct": pct, "ts": time.time()})
-    )
-    _prune_ctx()
-
-
-def _prune_ctx() -> None:
-    """Drop records for sessions that ended. Nothing signals the end, so age does:
-    a live session rewrites its record on every statusline render."""
-    cutoff = time.time() - 86400
-    for p in CTX_DIR.glob("*.json"):
-        try:
-            if p.stat().st_mtime < cutoff:
-                p.unlink()
-        except OSError:
-            pass
-
-
-def read_context(session_id: str) -> dict | None:
-    try:
-        return json.loads((CTX_DIR / f"{session_id}.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def record_limits(payload: dict) -> None:
-    """Persist the account's rate-limit windows from a statusline payload. They
-    belong to the account, so any session's render can update them — but only
-    upwards: Claude Code reports the limits its *last API response* carried, so
-    an idle session keeps re-rendering an old snapshot of the same window. Usage
-    only climbs until a window resets, which makes the highest reading in a
-    window the newest one, and keeps the bars from flapping between sessions."""
-    rl = payload.get("rate_limits") or {}
-    now = time.time()
-    prev = _load_limits()
-    rec = {"ts": now}
-    for key in ("five_hour", "seven_day"):
-        w = rl.get(key) or {}
-        pct = w.get("used_percentage")
-        if pct is None:
-            continue
-        resets = w.get("resets_at")
-        if resets and resets <= now:
-            continue  # window already reset — this payload predates it
-        old = prev.get(key) or {}
-        if old.get("resets_at") == resets and (old.get("pct") or 0) > pct:
-            rec[key] = old  # same window, lower number → older snapshot
-        else:
-            rec[key] = {"pct": pct, "resets_at": resets}
-    for key in ("five_hour", "seven_day"):
-        # a payload missing one window must not drop what another session knows
-        old = prev.get(key) or {}
-        if key not in rec and old and (old.get("resets_at") or now + 1) > now:
-            rec[key] = old
-    if len(rec) == 1:
-        return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    LIMITS_FILE.write_text(json.dumps(rec))
-
-
-def _load_limits() -> dict:
-    try:
-        return json.loads(LIMITS_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return {
+        "used": used,
+        "limit": rec.get("context_window_size") or 0,
+        # hud caches Claude Code's own percentage, which is authoritative: it
+        # knows what it reserves for the output budget, our ratio doesn't.
+        "pct": rec.get("used_percentage"),
+        "ts": (rec.get("saved_at") or 0) / 1000,
+    }
 
 
 def _cswap_accounts() -> list[dict]:
-    """Every account claude-swap knows, newest measurement each. When cswap is
-    driving the accounts it beats the statusline tee outright: it polls each
+    """Every account claude-swap knows, newest measurement each. It polls each
     account's usage directly, so a swap moves the bars at once, no session can
     report the window of an account that is no longer active, and the accounts
     you are *not* on are worth seeing — that's where the headroom is."""
@@ -1897,22 +1796,15 @@ def _cswap_accounts() -> list[dict]:
 
 
 def read_limits() -> list[dict]:
-    """Rate-limit windows to draw, one entry per account. cswap's own table when
-    it's there, else the single account the statusline tee saw."""
-    fresh = [a for a in _cswap_accounts() if time.time() - a["ts"] <= LIMITS_STALE]
-    if fresh:
-        return fresh
-    rec = _load_limits()
-    if not rec or time.time() - rec.get("ts", 0) > LIMITS_STALE:
-        return []
-    rec.update({"id": "", "label": "", "email": "", "active": True})
-    return [rec]
+    """Rate-limit windows to draw, one entry per account. cswap polls them per
+    account; nothing else on disk carries them (Claude Code states them in the
+    statusline payload alone), so without cswap there are no bars to draw."""
+    return [a for a in _cswap_accounts() if time.time() - a["ts"] <= LIMITS_STALE]
 
 
 # -- hook install/uninstall -------------------------------------------------
 
 HOOK_TAG = "claudetell.py hook"
-STATUSLINE_TAG = "claudetell.py statusline"
 
 
 def hook_entries() -> dict[str, list[dict]]:
@@ -1937,31 +1829,6 @@ def _is_ours(rule: dict) -> bool:
     return any(HOOK_TAG in h.get("command", "") for h in rule.get("hooks", []))
 
 
-def _wrap_statusline(settings: dict) -> str:
-    """Put claudetell in front of the configured statusline, passing its payload
-    through untouched. Idempotent, and a no-op when nothing is configured — we
-    only tee an existing statusline, never become one."""
-    sl = settings.get("statusLine")
-    if not isinstance(sl, dict) or sl.get("type") != "command":
-        return "no statusLine configured — context bars fall back to a guessed window size"
-    cmd = sl.get("command", "")
-    if STATUSLINE_TAG in cmd:
-        return "statusline already tee'd"
-    sl["_claudetell_wrapped"] = cmd  # verbatim: what we re-run, and what we restore
-    sl["command"] = f"python3 {shlex.quote(str(Path(__file__).resolve()))} statusline"
-    return "statusline tee'd (your statusline still renders it, untouched)"
-
-
-def _unwrap_statusline(settings: dict) -> None:
-    sl = settings.get("statusLine")
-    if isinstance(sl, dict) and STATUSLINE_TAG in sl.get("command", ""):
-        original = sl.pop("_claudetell_wrapped", None)
-        if original:
-            sl["command"] = original
-        else:
-            del settings["statusLine"]
-
-
 def cmd_install() -> None:
     settings_file = CLAUDE_DIR / "settings.json"
     settings = {}
@@ -1975,11 +1842,9 @@ def cmd_install() -> None:
         existing = hooks.setdefault(event, [])
         existing[:] = [r for r in existing if not _is_ours(r)]
         existing.extend(rules)
-    note = _wrap_statusline(settings)
     settings_file.write_text(json.dumps(settings, indent=2))
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"hooks installed in {settings_file} (backup: *.claudetell.bak)")
-    print(note)
     print("restart running claude sessions (or /hooks reload) to pick them up")
 
 
@@ -1993,9 +1858,8 @@ def cmd_uninstall() -> None:
         hooks[event] = [r for r in hooks[event] if not _is_ours(r)]
         if not hooks[event]:
             del hooks[event]
-    _unwrap_statusline(settings)
     settings_file.write_text(json.dumps(settings, indent=2))
-    print("claudetell hooks removed, statusline restored")
+    print("claudetell hooks removed")
 
 
 # -- frontend ---------------------------------------------------------------
@@ -2244,8 +2108,6 @@ def main() -> None:
     cmd = args[0] if args else "overlay"
     if cmd == "hook":
         cmd_hook()
-    elif cmd == "statusline":
-        cmd_statusline()
     elif cmd == "focus":
         cmd_focus(args[1] if len(args) > 1 else "")
     elif cmd == "overlay":
