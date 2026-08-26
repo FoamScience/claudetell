@@ -12,7 +12,7 @@
 Usage:
   claudetell.py [overlay]             native always-on-top overlay (default)
   claudetell.py serve [--host 127.0.0.1] [--port 7717]   browser version
-  claudetell.py json [--all]          print live sessions as JSON (used over SSH)
+  claudetell.py json [--all]          print live sessions + rate limits as JSON (over SSH)
   claudetell.py focus <query>         focus a session's window/pane (bind to a key)
   claudetell.py hook                  hook entrypoint (stdin JSON from Claude Code)
   claudetell.py install               register hooks
@@ -969,15 +969,15 @@ def load_remotes() -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def fetch_remote(remote: dict, src: str) -> list[dict]:
-    """SSH to a host and run claudetell's json scan there; tag the sessions with
-    the host. The remote computes its own lights (it owns the /proc + transcripts
+def fetch_remote(remote: dict, src: str) -> dict:
+    """SSH to a host and run claudetell's json scan there; tag its sessions and
+    rate-limit accounts with the host. The remote computes its own lights (it owns the /proc + transcripts
     + hook state), so by default we just pipe THIS script to its python3 — no
     install or version-sync needed. Set "cmd" to run an installed copy instead."""
     name = remote.get("name") or remote.get("ssh") or "remote"
     target = remote.get("ssh")
     if not target:
-        return []
+        return {"sessions": [], "limits": []}
     opts = remote.get("ssh_opts") or ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
     cmd = remote.get("cmd")
     argv = ["ssh", *opts, target] + (cmd.split() if cmd else ["python3", "-", "json"])
@@ -991,13 +991,23 @@ def fetch_remote(remote: dict, src: str) -> list[dict]:
         )
         data = json.loads(out.stdout)
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
-        return []
+        return {"sessions": [], "limits": []}
     sessions = data.get("sessions", []) if isinstance(data, dict) else data
+    limits = data.get("limits", []) if isinstance(data, dict) else []
+    if not isinstance(sessions, list):
+        sessions = []
+    if not isinstance(limits, list):
+        limits = []
     for s in sessions:
         s["remote"] = True
         s["host"] = name
         s["id"] = f"{name}:{s.get('id', '')}"  # namespace so ids never collide
-    return sessions if isinstance(sessions, list) else []
+    for a in limits:
+        a["remote"] = True
+        a["host"] = name
+        a["id"] = f"{name}:{a.get('id', '')}"
+        a["label"] = f"{name}:{a.get('label', '')}".rstrip(":")
+    return {"sessions": sessions, "limits": limits}
 
 
 # -- server -----------------------------------------------------------------
@@ -1009,7 +1019,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.startswith("/api/sessions"):
             body = json.dumps(
-                {"now": time.time() * 1000, "sessions": scan_sessions(self.show_all)}
+                {
+                    "now": time.time() * 1000,
+                    "sessions": scan_sessions(self.show_all),
+                    "limits": read_limits(),
+                }
             ).encode()
             ctype = "application/json"
         elif self.path == "/" or self.path.startswith("/index"):
@@ -1107,6 +1121,8 @@ def _overlay_css(alpha: float = 0.6) -> bytes:
         " text-shadow: 0 1px 1px rgba(255,255,255,0.25); }",
         ".name { color: #cdd6f4; font-size: 11px; }",
         ".ulbl { color: #a6adc8; font-size: 9px; font-weight: 700; }",
+        ".ulbl.cur { color: #a6e3a1; }",  # the account you're on, here
+        ".ulbl.curem { color: #89b4fa; }",  # ...on a remote host
         # context-usage bar: GTK3 progressbars style through their trough/progress
         # sub-nodes, so min-height has to land on both or the bar keeps its default.
         "progressbar.ctx trough { min-height: 4px; min-width: 26px;"
@@ -1227,6 +1243,8 @@ def cmd_overlay() -> None:
     def usage_tooltip(row, _x, _y, _kb, tip):
         acct = row._acct
         who = acct["email"] or "this account"
+        if acct.get("host"):
+            who = f"{acct['host']}: {who}"
         head = f"<b>{GLib.markup_escape_text(who)}</b>"
         if not acct["active"] and acct["email"]:
             head += " <i>(not active)</i>"
@@ -1270,14 +1288,55 @@ def cmd_overlay() -> None:
             usage_rows[key] = row
         return row
 
+    def dedup_accounts(accounts: list[dict]) -> list[dict]:
+        """One row per account, not per host: the same login polled on two
+        machines is one set of windows. Keyed on email (the only cross-host
+        identity — the account *number* is per-machine), newest reading wins,
+        and the key doubles as the row id so a swap can't churn the rows."""
+        by_email: dict[str, dict] = {}
+        out = []
+        for a in accounts:
+            a = dict(a, active_host=a.get("host") if a["active"] else None)
+            email = a.get("email")
+            if not email:
+                out.append(a)
+                continue
+            a["id"] = email
+            prev = by_email.get(email)
+            if prev is None:
+                by_email[email] = a
+                out.append(a)
+                continue
+            # active anywhere → active: it's the same account either way, and
+            # the machine you're looking at isn't necessarily the one on it.
+            active = prev["active"] or a["active"]
+            # local wins the "where" — that's the machine you're looking at
+            hosts = [x["active_host"] for x in (prev, a) if x["active"]]
+            host = None if not hosts or None in hosts else hosts[0]
+            if a["ts"] > prev["ts"]:
+                out[out.index(prev)] = a
+                by_email[email] = a
+                prev = a
+            prev["active"] = active
+            prev["active_host"] = host if active else None
+        return out
+
     def set_usage() -> None:
-        accounts = read_limits() if cfg.get("usage", True) else []
+        accounts = dedup_accounts(
+            read_limits() + remote_cache["limits"] if cfg.get("usage", True) else []
+        )
         seen = set()
         for pos, acct in enumerate(accounts):
             seen.add(acct["id"])
             row = usage_row(acct["id"])
             row._acct = acct
             row._num.set_text(f"#{acct['label']}")
+            num_style = row._num.get_style_context()
+            for name, on in (
+                ("cur", acct["active"] and not acct["active_host"]),
+                ("curem", bool(acct["active_host"])),  # active on a remote host
+            ):
+                (num_style.add_class if on else num_style.remove_class)(name)
             row._num.set_visible(len(accounts) > 1 and bool(acct["label"]))
             for window, (cell, bar) in row._bars.items():
                 w = acct.get(window)
@@ -1324,17 +1383,20 @@ def cmd_overlay() -> None:
 
     # poll configured remote hosts over SSH off the GTK thread; refresh() merges
     # the latest cached result. One writer, one reader, atomic list swap → no lock.
-    remote_cache = {"sessions": []}
+    remote_cache = {"sessions": [], "limits": []}
     remotes = load_remotes()
     if remotes:
         src = Path(__file__).read_text()
 
         def poll_remotes() -> None:
             while True:
-                merged = []
+                merged, accts = [], []
                 for r in remotes:
-                    merged += fetch_remote(r, src)
+                    got = fetch_remote(r, src)
+                    merged += got["sessions"]
+                    accts += got["limits"]
                 remote_cache["sessions"] = merged
+                remote_cache["limits"] = accts
                 time.sleep(REMOTE_INTERVAL)
 
         threading.Thread(target=poll_remotes, daemon=True).start()
@@ -2117,7 +2179,11 @@ def main() -> None:
         host = args[args.index("--host") + 1] if "--host" in args else "127.0.0.1"
         cmd_serve(port, "--all" in args, host)
     elif cmd == "json":
-        print(json.dumps({"sessions": scan_sessions("--all" in args)}))
+        print(
+            json.dumps(
+                {"sessions": scan_sessions("--all" in args), "limits": read_limits()}
+            )
+        )
     elif cmd == "install":
         cmd_install()
     elif cmd == "uninstall":
