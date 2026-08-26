@@ -69,27 +69,23 @@ plain (`claude-opus-4-8`) — never the `[1m]` variant that distinguishes a 1M
 model from its 200k twin. Guessing therefore gets it badly wrong: 147k tokens is
 74% of a 200k window but 15% of a 1M one.
 
-So `install` puts claudetell *in front of* your statusline. It reads the
-payload, records `context_window` to `~/.local/state/claudetell/ctx/<id>.json`,
-then runs your original statusline command with the same stdin and prints its
-output verbatim. Your statusline is unchanged — claudetell just reads the mail.
-The displaced command is stored next to it in `settings.json` as
-`_claudetell_wrapped`, and `uninstall` puts it back.
+claudetell reads that payload second-hand, from
+[claude-hud](https://github.com/jarrodwatts/claude-hud). hud renders the
+statusline and caches each session's reading to
+`~/.claude/plugins/claude-hud/context-cache/<sha256 of transcript path>.json`
+— window size, Claude Code's own used percentage, and the token counts behind
+it. We hash the transcript path the same way and read the file. Nothing of ours
+goes near `settings.json`'s `statusLine`.
 
-```jsonc
-"statusLine": {
-  "type": "command",
-  "command": "python3 /path/to/claudetell.py statusline",
-  "_claudetell_wrapped": "<your original command, verbatim>"
-}
-```
+An earlier version tee'd the statusline instead, keeping your original command
+in `statusLine._claudetell_wrapped`. Claude Code rewrites `settings.json` and
+drops keys it doesn't know, so the tee kept losing the command it was supposed
+to re-run and left the statusline blank. Don't bring it back.
 
-Every failure in the tee is swallowed and the wrapped command still runs — a
-missing bar is cosmetic, a broken statusline is not. If you have no statusline
-configured, claudetell does **not** install itself as one; it falls back to the
-transcript's token count against a guessed window tier (200k, then 1M), and the
-hover text marks those as `(est.)`. Same fallback for a session that hasn't
-rendered its statusline yet, and for remote hosts without the tee installed.
+Without hud's cache — hud not installed, a session it hasn't rendered yet, a
+remote host without it — claudetell falls back to the transcript's token count
+against a guessed window tier (200k, then 1M), and the hover text marks those as
+`(est.)`.
 
 ## Focus a session
 
