@@ -1099,6 +1099,24 @@ LIGHT_RGB = {
 PULSE_PERIOD = {"busy": 1.6, "blue": 2.2, "mauve": 2.2, "orange": 1.1, "red": 0.8}
 LIGHT_PX = 24
 OVERLAY_CFG = STATE_DIR / "overlay.json"
+TRAY_ICONS = STATE_DIR / "icons"
+# worst-first: the tray dot shows the single most urgent session
+LIGHT_PRIORITY = ("red", "orange", "busy", "mauve", "blue", "green", "gray")
+
+
+def tray_icon(light: str) -> str:
+    """Path to the tray dot for a light colour. SNI's icon name may be an
+    absolute path (gnome-shell's appindicator and KDE both take one), which
+    saves installing an icon theme."""
+    p = TRAY_ICONS / f"{light}.svg"
+    if not p.exists():
+        TRAY_ICONS.mkdir(parents=True, exist_ok=True)
+        r, g, b = LIGHT_RGB[light]
+        p.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
+            f'<circle cx="11" cy="11" r="8" fill="#{r:02x}{g:02x}{b:02x}"/></svg>'
+        )
+    return str(p)
 
 
 def _overlay_css(alpha: float = 0.6) -> bytes:
@@ -1177,7 +1195,7 @@ def cmd_overlay() -> None:
             sys.path.append("/usr/lib/python3/dist-packages")
             import gi
         gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk, Gdk, GLib, Pango
+        from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Pango
     except (ImportError, ValueError):
         sys.exit(
             "GTK3 not available (apt install python3-gi gir1.2-gtk-3.0) — "
@@ -1400,6 +1418,52 @@ def cmd_overlay() -> None:
                 time.sleep(REMOTE_INTERVAL)
 
         threading.Thread(target=poll_remotes, daemon=True).start()
+
+    tray_items: list[Gtk.Widget] = []
+
+    def tray_row(s: dict) -> Gtk.MenuItem:
+        who = f"{s['host']}: {s['name']}" if s.get("host") else s["name"]
+        pct = s.get("ctx_pct")
+        label = f"{who} — {s['status']}" + (f" · {pct}%" if pct else "")
+        item = Gtk.ImageMenuItem(label=label)
+        # dbusmenu carries the pixbuf, so the light's colour survives into the tray
+        item.set_image(Gtk.Image.new_from_pixbuf(
+            GdkPixbuf.Pixbuf.new_from_file_at_size(tray_icon(s["light"]), 16, 16)))
+        item.set_always_show_image(True)
+        item.connect("activate", lambda _i, e=s: focus_session(e))
+        return item
+
+    def set_tray(sessions: list[dict]) -> None:
+        if not indicator:
+            return
+        worst = next(
+            (c for c in LIGHT_PRIORITY if any(s["light"] == c for s in sessions)),
+            "gray",
+        )
+        if worst != state.get("tray"):
+            state["tray"] = worst
+            indicator.set_icon_full(tray_icon(worst), worst)
+        waiting = sum(1 for s in sessions if s["light"] in ("orange", "red"))
+        indicator.set_label(str(waiting) if waiting else "", "99")
+        # session rows on top of the menu; rebuilt only when one visibly changes
+        sig = [(s["id"], s["light"], s["name"], s["status"], s.get("ctx_pct"))
+               for s in sessions]
+        if sig == state.get("tray_sig"):
+            return
+        state["tray_sig"] = sig
+        for it in tray_items:
+            it.destroy()
+        tray_items.clear()
+        rows = [tray_row(s) for s in sessions]
+        if not rows:
+            empty = Gtk.MenuItem(label="no sessions")
+            empty.set_sensitive(False)
+            rows = [empty]
+        rows.append(Gtk.SeparatorMenuItem())
+        for i, item in enumerate(rows):
+            menu.insert(item, i)
+            tray_items.append(item)
+        menu.show_all()
 
     def set_empty() -> None:
         if lights and state["empty"]:
@@ -1641,6 +1705,7 @@ def cmd_overlay() -> None:
             regroup(sessions)
             apply_layout(cfg.get("layout", "v"))
         flow.show_all()
+        set_tray(sessions)
         return True
 
     menu = Gtk.Menu()
@@ -1739,7 +1804,36 @@ def cmd_overlay() -> None:
     quit_item = Gtk.MenuItem(label="Quit claudetell")
     quit_item.connect("activate", Gtk.main_quit)
     menu.append(quit_item)
+
+    # tray icon (StatusNotifierItem) — the overlay's menu, plus one dot for the
+    # worst live session, so claudetell can run without the overlay on screen.
+    try:
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3
+
+        indicator = AppIndicator3.Indicator.new(
+            "claudetell", tray_icon("gray"),
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+    except (ImportError, ValueError):
+        indicator = None  # no typelib (apt install gir1.2-appindicator3-0.1)
+
+    if indicator:
+        def toggle_overlay(item) -> None:
+            cfg["overlay"] = item.get_active()
+            win.set_visible(cfg["overlay"])
+            save_cfg()
+
+        overlay_item = Gtk.CheckMenuItem(label="Show overlay")
+        overlay_item.set_active(cfg.get("overlay", False))
+        overlay_item.connect("toggled", toggle_overlay)
+        menu.insert(overlay_item, 0)
+        menu.insert(Gtk.SeparatorMenuItem(), 1)
+
     menu.show_all()
+    if indicator:
+        indicator.set_menu(menu)
 
     def on_press(_w, event):
         if event.button == 3:
@@ -1774,6 +1868,8 @@ def cmd_overlay() -> None:
         win.move(*cfg["pos"])
     else:
         place()
+    if indicator and not cfg.get("overlay", False):
+        win.hide()
     try:
         Gtk.main()
     finally:
