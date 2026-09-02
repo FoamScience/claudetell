@@ -54,6 +54,19 @@ behind it, lights stay solid) and quit.
 Left-drag moves it anywhere and switches position to free. Defaults: vertical,
 top right. All choices persist.
 
+### Tray
+
+Registers a StatusNotifierItem (needs `gir1.2-appindicator3-0.1`; on GNOME the
+*AppIndicator* extension) and, when it does, starts with the overlay hidden —
+the tray is the whole UI. The icon is one dot in the worst live session's colour
+(red > orange > busy > mauve > blue > green), with a count beside it when
+sessions are waiting on you. Clicking it opens a menu listing every session —
+`host: name - status - context%`, each with its own coloured dot — and clicking
+a session focuses its pane and terminal window, same as clicking its light.
+Below that sit a **Show overlay** toggle and the overlay's own options. Session
+rows rebuild only when one visibly changes. The dots are SVGs written to
+`~/.local/state/claudetell/icons/` and passed to SNI as a path.
+
 Browser version also exists — `uv run claudetell.py serve` →
 http://127.0.0.1:7717, with a ⧉ button for a Chrome picture-in-picture
 always-on-top window. `--host` and `--port` override the bind address
