@@ -123,6 +123,15 @@ if __name__ == "__main__":
     print("ok")
 
 
+def test_usage_label_counts_down_to_the_window_length():
+    now = time.time()
+    assert claudetell.usage_label({"resets_at": now + 9000}, "5h", 3600) == "2.5/5h"
+    assert claudetell.usage_label({"resets_at": now + 3 * 86400}, "7d", 86400) == "3/7d"
+    assert claudetell.usage_label({"resets_at": now - 10}, "5h", 3600) == "0/5h"
+    # no reset time on the wire: the plain window label, no fake countdown
+    assert claudetell.usage_label({}, "7d", 86400) == "7d"
+
+
 def test_read_limits_reports_every_cswap_account(tmp_path, monkeypatch):
     monkeypatch.setattr(claudetell, "STATE_DIR", tmp_path)
     monkeypatch.setattr(claudetell, "CSWAP_DIR", tmp_path / "cswap")
