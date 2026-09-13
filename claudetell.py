@@ -1256,7 +1256,10 @@ def cmd_overlay() -> None:
     box.pack_start(flow, True, True, 0)
     win.add(box)
 
-    WINDOWS = (("five_hour", "5h", "5 hour"), ("seven_day", "7d", "7 day"))
+    WINDOWS = (
+        ("five_hour", "5h", "5 hour", 3600),
+        ("seven_day", "7d", "7 day", 86400),
+    )
 
     def usage_tooltip(row, _x, _y, _kb, tip):
         acct = row._acct
@@ -1267,7 +1270,7 @@ def cmd_overlay() -> None:
         if not acct["active"] and acct["email"]:
             head += " <i>(not active)</i>"
         lines = [head]
-        for window, _short, long in WINDOWS:
+        for window, _short, long, _unit in WINDOWS:
             w = acct.get(window)
             if not w:
                 continue
@@ -1289,7 +1292,7 @@ def cmd_overlay() -> None:
             num.set_no_show_all(True)  # nothing to disambiguate on one account
             row.pack_start(num, False, False, 0)
             row._num, row._bars = num, {}
-            for window, short, _long in WINDOWS:
+            for window, short, _long, unit in WINDOWS:
                 lbl = Gtk.Label(label=short, xalign=0)
                 lbl.get_style_context().add_class("ulbl")
                 bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER)
@@ -1298,7 +1301,7 @@ def cmd_overlay() -> None:
                 cell.pack_start(lbl, False, False, 0)
                 cell.pack_start(bar, True, True, 0)
                 row.pack_start(cell, True, True, 0)
-                row._bars[window] = (cell, bar)
+                row._bars[window] = (cell, lbl, bar, unit, short)
             row.set_has_tooltip(True)
             row.connect("query-tooltip", usage_tooltip)
             usage_box.pack_start(row, False, False, 0)
@@ -1356,11 +1359,12 @@ def cmd_overlay() -> None:
             ):
                 (num_style.add_class if on else num_style.remove_class)(name)
             row._num.set_visible(len(accounts) > 1 and bool(acct["label"]))
-            for window, (cell, bar) in row._bars.items():
+            for window, (cell, lbl, bar, unit, short) in row._bars.items():
                 w = acct.get(window)
                 cell.set_visible(bool(w))
                 if not w:
                     continue
+                lbl.set_text(usage_label(w, short, unit))
                 frac = min(1.0, max(0.0, w["pct"] / 100.0))
                 bar.set_fraction(frac)
                 style = bar.get_style_context()
@@ -1951,6 +1955,14 @@ def _cswap_accounts() -> list[dict]:
         if "five_hour" in rec or "seven_day" in rec:
             out.append(rec)
     return out
+
+
+def usage_label(w: dict, short: str, unit: int) -> str:
+    """Bar label: time left in the window over its length, e.g. '2.5/5h'."""
+    if not w.get("resets_at"):
+        return short
+    left = max(0.0, w["resets_at"] - time.time()) / unit
+    return f"{round(left, 1):g}/{short}"
 
 
 def read_limits() -> list[dict]:
