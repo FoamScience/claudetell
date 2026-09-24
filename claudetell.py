@@ -254,29 +254,59 @@ def session_letter(name: str) -> str:
     return "?"
 
 
-_env_cache: dict[int, tuple[str | None, str | None, str | None]] = {}
+_env_cache: dict[int, tuple[str | None, dict[str, str]]] = {}
+_ENV_KEYS = ("TMUX_PANE", "TMUX", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH")
 
 
-def session_tmux(pid: int) -> tuple[str | None, str | None]:
-    """(TMUX_PANE, tmux socket) from the session process's environ, cached.
+def session_env(pid: int) -> dict[str, str]:
+    """Multiplexer vars (tmux, herdr) from the session process's environ, cached.
     environ is fixed at exec, so (pid, starttime) is a safe cache key."""
     st = proc_starttime(pid)
     cached = _env_cache.get(pid)
     if cached and cached[0] == st:
-        return cached[1], cached[2]
-    pane = sock = None
+        return cached[1]
+    env = {}
     try:
         raw = open(f"/proc/{pid}/environ", "rb").read()
         for kv in raw.split(b"\0"):
             k, _, v = kv.partition(b"=")
-            if k == b"TMUX_PANE":
-                pane = v.decode("utf-8", "replace")
-            elif k == b"TMUX":  # <socket>,<server-pid>,<session-n>
-                sock = v.decode("utf-8", "replace").split(",")[0] or None
+            key = k.decode("utf-8", "replace")
+            if key in _ENV_KEYS and v:
+                env[key] = v.decode("utf-8", "replace")
     except OSError:
         pass
-    _env_cache[pid] = (st, pane, sock)
-    return pane, sock
+    _env_cache[pid] = (st, env)
+    return env
+
+
+def session_tmux(env: dict[str, str]) -> tuple[str | None, str | None]:
+    """(TMUX_PANE, tmux socket); TMUX is <socket>,<server-pid>,<session-n>."""
+    return env.get("TMUX_PANE"), env.get("TMUX", "").split(",")[0] or None
+
+
+def _herdr_argv(entry: dict) -> list[str]:
+    """herdr CLI aimed at the server hosting a session's pane. The binary path
+    comes from the pane env since ~/.local/bin may be off a non-login PATH."""
+    sock = entry.get("herdr_sock")
+    return ((["env", f"HERDR_SOCKET_PATH={sock}"] if sock else [])
+            + [entry.get("herdr_bin") or "herdr"])
+
+
+def _herdr_client_pids() -> list[int]:
+    """Attached herdr clients — the terminals worth raising.
+    ponytail: assumes one herdr server; match client --session to the socket if several."""
+    pids = []
+    for pid, (_, comm, _) in _proc_table().items():
+        if comm != "herdr":
+            continue
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        args = [a for a in argv[1:] if a]
+        if not args or args[0].startswith(b"-"):  # `herdr [--session x]`, not a subcommand
+            pids.append(pid)
+    return pids
 
 
 def tmux_session_name(sock: str | None, pane: str | None) -> str | None:
@@ -506,13 +536,16 @@ def _remote_select_window(entry: dict) -> None:
         (r for r in load_remotes()
          if (r.get("name") or r.get("ssh")) == entry.get("host", "")), None)
     target = remote and remote.get("ssh")
-    if not (pane and target):
+    if not ((pane or entry.get("herdr_pane")) and target):
         return
     opts = remote.get("ssh_opts") or ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-    sock = entry.get("tmux_sock")
-    tmux = "tmux" + (f" -S {shlex.quote(sock)}" if sock else "")
-    p = shlex.quote(pane)
-    rcmd = f"{tmux} select-window -t {p} && {tmux} select-pane -t {p}"
+    if entry.get("herdr_pane"):
+        rcmd = shlex.join(_herdr_argv(entry) + ["agent", "focus", entry["herdr_pane"]])
+    else:
+        sock = entry.get("tmux_sock")
+        tmux = "tmux" + (f" -S {shlex.quote(sock)}" if sock else "")
+        p = shlex.quote(pane)
+        rcmd = f"{tmux} select-window -t {p} && {tmux} select-pane -t {p}"
     try:
         subprocess.run(
             ["ssh", *opts, target, rcmd], timeout=6, check=False,
@@ -522,10 +555,10 @@ def _remote_select_window(entry: dict) -> None:
 
 
 def focus_session(entry: dict) -> None:
-    """Focus the tmux pane + terminal GUI window hosting a session. Local
+    """Focus the tmux/herdr pane + terminal GUI window hosting a session. Local
     sessions use their own pane/pid; a remote session (over SSH) is matched to
-    the LOCAL tmux pane that hosts it by window/pane name. tmux switches the
-    pane; kitty IPC (or xdotool) raises the window."""
+    the LOCAL tmux pane that hosts it by window/pane name. tmux or herdr switches
+    the pane; kitty IPC (or xdotool) raises the window."""
     if entry.get("remote"):
         # remote pane/pid live on another machine. The session is open locally
         # in an `ssh … tmux a -t <sess>` window; find that kitty window (ssh host
@@ -552,6 +585,17 @@ def focus_session(entry: dict) -> None:
         pane, sock, local_pid = (
             entry.get("pane"), entry.get("tmux_sock"), entry.get("pid", 0))
     pids = []
+    if not entry.get("remote") and entry.get("herdr_pane"):
+        # agent focus switches workspace, tab and pane in one call
+        try:
+            subprocess.run(
+                _herdr_argv(entry) + ["agent", "focus", entry["herdr_pane"]],
+                timeout=2, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for cp in _herdr_client_pids():
+            pids += _ancestor_chain(cp)
     if pane:
         base = ["tmux"] + (["-S", sock] if sock else [])
 
@@ -919,7 +963,8 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
                 status = "idle"
         light, detail, counts = compute_light(status, st, err, pid)
         used, limit, pct = session_context(sid)
-        pane, tmux_sock = session_tmux(pid)
+        env = session_env(pid)
+        pane, tmux_sock = session_tmux(env)
         name = data.get("name") or Path(data.get("cwd", "?")).name
         entry = {
             "id": sid,
@@ -930,6 +975,9 @@ def scan_sessions(show_all: bool = False) -> list[dict]:
             "pane": pane,
             "tmux_sock": tmux_sock,
             "tmux_session": tmux_session_name(tmux_sock, pane),
+            "herdr_pane": env.get("HERDR_PANE_ID"),
+            "herdr_sock": env.get("HERDR_SOCKET_PATH"),
+            "herdr_bin": env.get("HERDR_BIN_PATH"),
             "kind": data.get("kind", ""),
             "version": data.get("version", ""),
             "startedAt": data.get("startedAt", 0),

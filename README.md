@@ -102,8 +102,8 @@ against a guessed window tier (200k, then 1M), and the hover text marks those as
 
 ## Focus a session
 
-Jump to the terminal a session is running in — its tmux pane is selected and
-the terminal window is raised.
+Jump to the terminal a session is running in — its tmux or
+[herdr](https://herdr.dev) pane is selected and the terminal window is raised.
 
 - **Click** a light (overlay or browser). Left-drag still moves the overlay; a
   click that doesn't drag focuses.
@@ -135,6 +135,10 @@ How it raises the window, in order:
 1. **tmux** — `select-window` + `select-pane` on the pane (captured from the
    session process's `TMUX_PANE`). This alone is enough when that terminal is
    already visible.
+   **herdr** — `herdr agent focus <pane>` (pane and server socket captured from
+   the session process's `HERDR_PANE_ID` / `HERDR_SOCKET_PATH`) switches
+   workspace, tab and pane; the attached `herdr` client is what gets raised.
+   Remote herdr sessions are switched the same way over SSH.
 2. **kitty** — via kitty's remote-control IPC (`kitten @ focus-window`), which
    works on Wayland. Requires kitty remote control enabled
    (`allow_remote_control yes` + a `listen_on` socket in `kitty.conf`).
